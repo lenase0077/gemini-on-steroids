@@ -3,7 +3,7 @@ import { runInNewContext } from 'node:vm';
 import { describe, expect, it } from 'vitest';
 
 const script = readFileSync(new URL('../extension/usage.js', import.meta.url), 'utf8');
-function harness() {
+function harness(hostname = 'chatgpt.com') {
   const posts: Array<Record<string, any>> = [];
   let now = Date.parse('2026-09-05T12:00:00Z');
   class Clock extends Date { static override now() { return now; } }
@@ -38,7 +38,7 @@ function harness() {
   };
   window.dispatchEvent = (event: { type: string }) => { dispatch(event.type, event); return true; };
   class MessageEvent { constructor(readonly type: string, init: Record<string, unknown>) { Object.assign(this, init); } }
-  const evaluate = (source = script) => runInNewContext(source, { window, document, location: { origin: 'https://chatgpt.com' }, URL, crypto, Date: Clock, TextDecoder, MessageEvent,
+  const evaluate = (source = script) => runInNewContext(source, { window, document, location: { origin: `https://${hostname}`, hostname }, URL, crypto, Date: Clock, TextDecoder, MessageEvent,
     setTimeout: (run: () => void, ms: number) => { timers.set(++timerId, { at: now + ms, run }); return timerId; },
     clearTimeout: (id: number) => timers.delete(id) });
   evaluate();
@@ -91,6 +91,7 @@ function harness() {
     needsReload: () => window.__cosUsageObserverNeedsReload === true,
     nativeSocket: Socket,
     socket: (url = 'wss://ws.chatgpt.com/ws') => new window.WebSocket(url),
+    socketConstructor: () => window.WebSocket,
     feed,
     feedSse,
     resume: async (status = 404, conversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
@@ -139,6 +140,20 @@ function harness() {
 }
 
 describe('MAIN-world usage projection', () => {
+  it('does not wrap or inspect Gemini WebSockets', () => {
+    const h = harness('gemini.google.com');
+    expect(h.socketConstructor()).toBe(h.nativeSocket);
+    const socket = h.socket('wss://ws.gemini.google.com/ws') as any;
+    socket.receive({ conversation_id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', metadata: { request_id: '11111111-2222-4333-8444-555555555555' } });
+    expect(h.posts).toEqual([]);
+    expect(h.socketConstructor()).toBe(h.nativeSocket);
+  });
+
+  it('keeps the legacy chat.openai.com WebSocket observer enabled', () => {
+    const h = harness('chat.openai.com');
+    expect(h.socketConstructor()).not.toBe(h.nativeSocket);
+  });
+
   it('H2 observes an exact resume 404 without reading its body and captures request ownership synchronously', async () => {
     const h = harness();
     const { starts, synchronousStarts } = await h.resume();

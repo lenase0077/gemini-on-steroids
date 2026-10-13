@@ -1,5 +1,6 @@
 import { offerToolInput, acknowledgeToolInput, TOOL_INPUT_HEADER } from '../session/input.js';
 import { noteConnectorUse } from '../connector-proof.js';
+import { inboundIsLocalBridge } from './inbound.js';
 import { pluginManager } from '../plugins/manager.js';
 import { WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-computer.js';
 /**
@@ -696,8 +697,10 @@ async function dispatchTracked(
   // Recorded here rather than in `guard` because only this layer knows which server
   // answered, and "was this connector ever actually used from ChatGPT" is a per-connector
   // question the setup screen has to answer honestly.
-  surfaceToolCallAt.set(surface, Date.now());
-  noteConnectorUse(surface, 'tool');
+  if (!inboundIsLocalBridge()) {
+    surfaceToolCallAt.set(surface, Date.now());
+    noteConnectorUse(surface, 'tool');
+  }
   // Proof for connector identity: this exact request reached this surface's own endpoint.
   if (!nested) noteServedRequest(requestId, surface);
   const isFinish = isFinishCall(name, args);

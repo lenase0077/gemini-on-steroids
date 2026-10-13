@@ -283,7 +283,7 @@ function endCapsuleMorph(): void {
  */
 async function connectionCapsuleAction(): Promise<void> {
   // It says Connect, so it connects, with or without the details open.
-  if (state?.status.state === 'disconnected') {
+  if (state?.status.state === 'disconnected' && !geminiBridgeReady(state)) {
     setConnectionPopover(false);
     if (missingStep(state)) { showTab('setup'); return; }
     const next = await run(api.connect());
@@ -712,6 +712,7 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark'; appearance?:
     ui: {
       ...previous.ui,
       defaultChatModel: $<HTMLSelectElement>('defaultChatModel').value || undefined,
+      newChatProvider: $<HTMLSelectElement>('newChatProvider').value as Config['ui']['newChatProvider'],
       defaultChatReasoning: ($<HTMLSelectElement>('defaultChatReasoning').value || undefined) as Config['ui']['defaultChatReasoning'],
       chatBrowser: $<HTMLSelectElement>('chatBrowser').value as ChatBrowser,
       finishTool: $<HTMLInputElement>('finishTool').checked,
@@ -817,6 +818,20 @@ const STATUS_TEXT: Record<AppState['status']['state'], string> = {
   'tunnel-unavailable': "Tunnel unavailable"
 };
 
+function geminiBridgeReady(next: AppState | null): boolean {
+  return next?.config.ui.newChatProvider === 'gemini' && next.status.localMcpReady === true;
+}
+
+function selectedConnectionRunning(next: AppState | null): boolean {
+  return !!next && (isRunning(next.status.state) || geminiBridgeReady(next));
+}
+
+function connectionStatusKey(next: AppState, status: AppState['status'] = next.status): string {
+  return geminiBridgeReady(next) && status.state === 'disconnected'
+    ? 'Local MCP bridge ready'
+    : STATUS_TEXT[status.state];
+}
+
 const METHOD_HINT: Record<string, string> = {
   openai:
     "ChatGPT reaches this computer through an OpenAI tunnel. Nothing is exposed to the open internet.",
@@ -864,6 +879,7 @@ function missingStep(
   if (config.roots.length === 0 && requiresApprovedFilesystemRoot(config)) {
     return { step: 'folder', text: t("Choose a folder to share — step {0}.", [setupStepNumber('folder')]) };
   }
+  if (config.ui.newChatProvider === 'gemini') return null;
   if (config.tunnel.kind === 'openai') {
     if (!TUNNEL_ID_PATTERN.test(values.tunnelId)) {
       return { step: 'tunnel', text: t("Create a tunnel and paste its ID — step {0}.", [setupStepNumber('tunnel')]) };
@@ -935,12 +951,13 @@ function paintAccess(next: AppState): void {
   const macConsent = next.platform?.family === 'macos' && level === 'full' && !!access &&
     (access.screen !== 'granted' || access.accessibility !== 'granted');
   const note = $('accessNote');
+  const geminiSelected = next.config.ui.newChatProvider === 'gemini';
   const text = () => level === 'read'
-    ? t("ChatGPT can only read files. Choose another option so it can edit files and run commands.")
+    ? t(geminiSelected ? "Gemini can only read files. Choose another option so it can edit files and run commands." : "ChatGPT can only read files. Choose another option so it can edit files and run commands.")
     : level === 'custom'
       ? accessWorks(next)
         ? t("Custom permissions, set in Workspace.")
-        : t("These permissions keep ChatGPT from editing files or running commands. Choose an option above, or change them in Workspace.")
+        : t(geminiSelected ? "These permissions keep Gemini from editing files or running commands. Choose an option above, or change them in Workspace." : "These permissions keep ChatGPT from editing files or running commands. Choose an option above, or change them in Workspace.")
       : macConsent
         ? t("On macOS, desktop control also needs Screen Recording and Accessibility in System Settings.")
         : '';
@@ -1342,7 +1359,7 @@ function paintSetupFields(): void {
 
 /** Connect is enabled from the persisted state or from valid drafts still in the fields. */
 function paintConnectButtons(next: AppState): void {
-  const running = isRunning(next.status.state), disconnecting = next.status.state === 'disconnecting';
+  const running = selectedConnectionRunning(next), disconnecting = next.status.state === 'disconnecting';
   const missing = currentSetupMissingStep(next);
   for (const id of ['connectionPopoverToggle', 'wizConnect']) {
     const button = $<HTMLButtonElement>(id);
@@ -1392,13 +1409,15 @@ function apply(next: AppState): void {
   applying = true;
   const { config } = next;
   const status = presentedStatus(next.status);
+  const geminiSelected = config.ui.newChatProvider === 'gemini';
 
   const connected = status.state === 'connected';
+  const localBridgeReady = geminiBridgeReady(next);
   const offline = status.state === 'offline';
   const disconnecting = status.state === 'disconnecting';
   const busy = disconnecting || status.state === 'starting-server' || status.state === 'connecting-tunnel';
   const failed = status.state === 'auth-failed' || status.state === 'tunnel-unavailable';
-  const running = isRunning(status.state);
+  const running = isRunning(status.state) || localBridgeReady;
   // The tunnel field is filled before Setup is judged: what is missing reads the fields, so that
   // drafts count, and on the first paint an unfilled field made a finished setup look unfinished.
   applyValue($<HTMLInputElement>('tunnelId'), config.tunnel.tunnelId, previousState?.config.tunnel.tunnelId);
@@ -1412,12 +1431,12 @@ function apply(next: AppState): void {
   // Connected, it is a quiet dot. Otherwise it opens to say what to do or what is happening: Connect,
   // Connecting…, or what went wrong. Its label keeps the last words while it closes, so the text
   // fades with the width instead of vanishing first.
-  const connectionTone = connected ? 'is-connected' : offline ? 'is-offline' : busy ? 'is-busy' : failed ? 'is-error' : '';
+  const connectionTone = connected || localBridgeReady ? 'is-connected' : offline ? 'is-offline' : busy ? 'is-busy' : failed ? 'is-error' : '';
   const sidebarConnection = $('sidebarConnection');
   const wasConnected = sidebarConnection.classList.contains('is-connected');
   // Disconnecting is work in progress like connecting: the capsule says so with the same light and sheen,
   // held on screen long enough to read (presentedStatus). The details stay calm (is-closing, no blink).
-  const labelled = !connected;
+  const labelled = !connected && !localBridgeReady;
   const capsuleTone = disconnecting ? 'is-closing' : connectionTone;
   // Open to open (Connect → Connecting…, → Failed), only the words change, and a width that comes from
   // text does not transition: measure it before and after and animate between the two. The capsule is
@@ -1426,7 +1445,7 @@ function apply(next: AppState): void {
   const label = $('sidebarConnectionLabel');
   const capsuleWords = (): string => disconnecting ? t('Disconnecting…') : busy ? t('Connecting…')
     // A failure says so in one short word; its reason is in the title and the details.
-    : offline ? t(STATUS_TEXT[status.state]) : failed ? t('Failed') : t('Connect');
+    : offline ? t(STATUS_TEXT[status.state]) : failed ? t('Failed') : t(localBridgeReady ? 'Local MCP bridge ready' : 'Connect');
   // Connecting sends several updates with the same words: those change nothing, and a morph under way
   // keeps going. New words morph from what is on screen now, the width mid-way included.
   // Opening from the dot (Disconnecting…) morphs the same way, with no old words to fade.
@@ -1492,15 +1511,17 @@ function apply(next: AppState): void {
     ], { duration: 900, easing: 'ease-out' });
   }
   if (previousConnectionState !== null && previousConnectionState !== status.state) {
-    ui($('connectionAnnounce'), 'textContent', () => t(STATUS_TEXT[status.state]));
+    ui($('connectionAnnounce'), 'textContent', () => t(connectionStatusKey(next, status)));
   }
   previousConnectionState = status.state;
   const connectionPopover = $('connectionPopover');
   connectionPopover.className = `connection-popover scroll${capsuleTone ? ` ${capsuleTone}` : ''}`;
-  ui($('connectionPopoverTitle'), 'textContent', () => t(STATUS_TEXT[status.state]));
+  ui($('connectionPopoverTitle'), 'textContent', () => t(connectionStatusKey(next, status)));
 
   const id = config.tunnel.tunnelId;
-  ui($('headerSub'), 'textContent', () => config.tunnel.kind === 'openai'
+  ui($('headerSub'), 'textContent', () => localBridgeReady
+      ? t('Local MCP bridge')
+      : config.tunnel.kind === 'openai'
       ? TUNNEL_ID_PATTERN.test(id)
         ? `${id.slice(0, 11)}…${id.slice(-4)}`
         : t("No tunnel yet")
@@ -1603,6 +1624,7 @@ function apply(next: AppState): void {
   );
   applyValue($<HTMLInputElement>('binaryPath'), config.tunnel.binaryPath, previousState?.config.tunnel.binaryPath);
   applyValue($<HTMLSelectElement>('chatBrowser'), config.ui.chatBrowser ?? 'chrome', previousState?.config.ui.chatBrowser ?? 'chrome');
+  applyValue($<HTMLSelectElement>('newChatProvider'), config.ui.newChatProvider ?? 'chatgpt', previousState?.config.ui.newChatProvider ?? 'chatgpt');
   $<HTMLSelectElement>('planBackend').value = config.ui.planBackend ?? 'chatgpt';
   applyChecked($<HTMLInputElement>('finishTool'), config.ui.finishTool === true, previousState?.config.ui.finishTool);
   applyValue($<HTMLSelectElement>('finishLeadMinutes'), String(config.ui.finishLeadMinutes ?? 5), String(previousState?.config.ui.finishLeadMinutes ?? 5));
@@ -1643,18 +1665,23 @@ function apply(next: AppState): void {
   );
   $('privacyScreenshotsSetting').hidden = !(next.platform?.desktopAutomation ?? true);
   if (next.platform?.family === 'macos') {
-    ui($('backgroundRunningCopy'), 'textContent', () => t("Leave it running while you use its plugins in ChatGPT. It stays available from the menu bar and Dock when you close the window."));
+    ui($('backgroundRunningCopy'), 'textContent', () => t(geminiSelected
+      ? "Leave the local MCP bridge running while you use Gemini. It stays available from the menu bar and Dock when you close the window."
+      : "Leave it running while you use its plugins in ChatGPT. It stays available from the menu bar and Dock when you close the window."));
     ui($('minimizeToTrayCopy'), 'textContent', () => t("Hide the window to the menu bar when closed"));
   } else {
-    ui($('backgroundRunningCopy'), 'textContent', () => t("Leave it running while you use its plugins in ChatGPT. It stays in the tray when you close the window."));
+    ui($('backgroundRunningCopy'), 'textContent', () => t(geminiSelected
+      ? "Leave the local MCP bridge running while you use Gemini. It stays in the tray when you close the window."
+      : "Leave it running while you use its plugins in ChatGPT. It stays in the tray when you close the window."));
     ui($('minimizeToTrayCopy'), 'textContent', () => t("Keep running in the tray when closed"));
   }
 
   const openai = config.tunnel.kind === 'openai';
   const browserRequired = browserExtensionRequired(config);
-  step('tunnel').hidden = !openai;
-  step('key').hidden = !openai;
+  step('tunnel').hidden = !openai || geminiSelected;
+  step('key').hidden = !openai || geminiSelected;
   step('browser').hidden = !browserRequired;
+  step('chatgpt').hidden = geminiSelected;
   const cosBrowser = (config.ui.chatBrowser ?? 'chrome') === 'cos';
   const browserProgress = browserSetup.render(next);
   for (const other of externalSetupLinks) other.hidden = !cosBrowser;
@@ -1695,13 +1722,17 @@ function apply(next: AppState): void {
   // The tunnel's state in one glance: a coloured badge, and the button that changes it. Only a
   // failure says more, since only then is there something to do about it.
   const wizConnect = $<HTMLButtonElement>('wizConnect');
-  const tone = failed ? 'bad' : status.state === 'connected' ? 'ok' : running || disconnecting ? 'wait' : 'off';
+  const tone = failed ? 'bad' : status.state === 'connected' || localBridgeReady ? 'ok' : running || disconnecting ? 'wait' : 'off';
   ui($('wizConnectLabel'), 'textContent', () => disconnecting ? t('Disconnecting…') : running ? t("Disconnect") : t("Connect"));
+  ui($('connectStepTitle'), 'textContent', () => t(geminiSelected ? 'Start the local MCP bridge' : 'Connect the tunnel'));
+  ui($('connectStepLead'), 'textContent', () => t(geminiSelected
+    ? 'Click Connect to start the local bridge. Gemini does not need a remote tunnel or a native ChatGPT plugin.'
+    : 'Click Connect and wait for Connected.'));
   wizConnect.disabled = connectBtn.disabled;
   wizConnect.dataset.tone = tone;
   const pill = $('wizStatusPill');
   pill.dataset.tone = tone;
-  ui(pill, 'textContent', () => t(STATUS_TEXT[status.state]));
+  ui(pill, 'textContent', () => t(connectionStatusKey(next, status)));
   const detail = $('wizStatus');
   detail.hidden = !failed || !status.detail;
   ui(detail, 'textContent', () => failed ? status.detail : '');
@@ -1727,7 +1758,7 @@ function apply(next: AppState): void {
   // Created is the plugin existing in ChatGPT: ChatGPT reached it, or listed it as installed.
   const unverified = surfaces.filter((surface) => surface.available && !pluginCreated(surface));
   const chatgptNote = $('wizChatgpt');
-  chatgptNote.hidden = reachedAt === null && unverified.length === surfaces.filter(surface => surface.available).length;
+  chatgptNote.hidden = geminiSelected || (reachedAt === null && unverified.length === surfaces.filter(surface => surface.available).length);
   chatgptNote.classList.toggle(
     'is-warn',
     reachedAt !== null && (ranAt === null || unverified.length > 0)
@@ -1760,7 +1791,7 @@ function apply(next: AppState): void {
   done.add('access');
   if (!openai || TUNNEL_ID_PATTERN.test(config.tunnel.tunnelId)) done.add('tunnel');
   if (!openai || next.hasApiKey) done.add('key');
-  if (connected) done.add('connect');
+  if (geminiSelected ? localBridgeReady : connected) done.add('connect');
   // The only honest proof the ChatGPT step is finished: ChatGPT has actually called the connectors
   // this app cannot work without. Judged per surface, because a Core request says nothing
   // about whether the Desktop connector was ever created. An optional connector never
@@ -1769,7 +1800,7 @@ function apply(next: AppState): void {
   const requiredUnverified = surfaces.some(
     (surface) => surface.available && !surface.optional && !pluginCreated(surface)
   );
-  if (!requiredUnverified && (reachedAt !== null || surfaces.some(surface => surface.available && pluginCreated(surface)))) done.add('chatgpt');
+  if (!geminiSelected && !requiredUnverified && (reachedAt !== null || surfaces.some(surface => surface.available && pluginCreated(surface)))) done.add('chatgpt');
   // External installation and the selected execution path must both be ready.
   if (!browserRequired || browserProgress.ready) done.add('browser');
   const current = order.find((name) => !done.has(name)) ?? null;
@@ -1824,7 +1855,7 @@ function apply(next: AppState): void {
       nav.querySelector<HTMLButtonElement>('[data-step-nav="next"]')!.disabled = !browserProgress.ready;
     }
   }
-  paintReady(shown, done, cosBrowser, allSet, accessLevel(next), !accessWorks(next));
+  paintReady(shown, done, cosBrowser, allSet, accessLevel(next), !accessWorks(next), geminiSelected);
 
   const needsBinary = config.tunnel.kind !== 'manual';
   ui($('binaryState'), 'textContent', () => !needsBinary
@@ -1973,7 +2004,10 @@ function facts(next: AppState): HTMLElement[] {
   const rows: [string, () => string, boolean?][] = [];
   const health = status.health;
 
-  if (isRunning(status.state)) {
+  if (geminiBridgeReady(next)) {
+    rows.push(['Local MCP bridge', () => t('ready')]);
+    rows.push(['Remote tunnel', () => t('not required for Gemini')]);
+  } else if (isRunning(status.state)) {
     rows.push(['Route to OpenAI', () => health?.route ?? t('Starting…')]);
     rows.push([
       'Poll errors',
@@ -2025,9 +2059,11 @@ function facts(next: AppState): HTMLElement[] {
  */
 function paintClock(): void {
   if (!state) return;
-  const { bridge } = state;
-  const status = shownStatus(state.status);
-  const running = isRunning(status.state);
+  const current = state;
+  const { bridge } = current;
+  const status = shownStatus(current.status);
+  const localBridgeReady = geminiBridgeReady(current);
+  const running = isRunning(status.state) || localBridgeReady;
   const connected = status.state === 'connected';
   const disconnecting = status.state === 'disconnecting';
 
@@ -2042,26 +2078,32 @@ function paintClock(): void {
   const core = status.surfaces.find((surface) => surface.id === 'core');
   ui($('connectionPopoverConnector'), 'textContent', () => disconnecting ? t('Disconnecting…') : !running
     ? t("Not connected")
+    : localBridgeReady
+      ? t('Local MCP bridge ready')
     : core?.lastRequestAt
       ? t("Reached")
       : connected
         ? t("waiting")
-        : t(STATUS_TEXT[status.state]));
+        : t(connectionStatusKey(current, status)));
   ui($('connectionPopoverBrowser'), 'textContent', () => bridge.present
     ? t("Connected")
     : bridge.paired ? t("Paired · not active") : t("Not connected"));
 
   const connectorRow = $('connectionPopoverConnector').parentElement!;
   const browserRow = $('connectionPopoverBrowser').parentElement!;
-  connectorRow.dataset.tone = connected ? 'ok' : disconnecting ? 'closing' : status.state === 'starting-server' || status.state === 'connecting-tunnel' ? 'wait' : 'bad';
+  connectorRow.dataset.tone = connected || localBridgeReady ? 'ok' : disconnecting ? 'closing' : status.state === 'starting-server' || status.state === 'connecting-tunnel' ? 'wait' : 'bad';
   browserRow.dataset.tone = bridge.present ? 'ok' : bridge.paired ? 'wait' : 'bad';
-  ui(connectorRow, 'title', () => core?.lastRequestAt ? t("Reached {0}", [ago(core.lastRequestAt)]) : $('connectionPopoverConnector').textContent ?? '');
+  ui(connectorRow, 'title', () => localBridgeReady
+    ? t('Local MCP bridge is ready; no remote tunnel or native ChatGPT plugin is active.')
+    : core?.lastRequestAt ? t("Reached {0}", [ago(core.lastRequestAt)]) : $('connectionPopoverConnector').textContent ?? '');
   ui(browserRow, 'title', () => bridge.lastSeenAt ? t("Seen {0}", [ago(bridge.lastSeenAt)]) : $('connectionPopoverBrowser').textContent ?? '');
-  ui($('connectionPopoverTitle'), 'title', () => disconnecting ? t('Closing connection…') : status.handshakeAt !== null ? t("verified {0}", [ago(status.handshakeAt)]) : t("no handshake yet"));
+  ui($('connectionPopoverTitle'), 'title', () => localBridgeReady
+    ? t('Local MCP bridge ready. Remote tunnel is not connected.')
+    : disconnecting ? t('Closing connection…') : status.handshakeAt !== null ? t("verified {0}", [ago(status.handshakeAt)]) : t("no handshake yet"));
 
   const triggerText = status.handshakeAt !== null && running
-    ? `${t(STATUS_TEXT[status.state])} · ${t("verified {0}", [ago(status.handshakeAt)])}`
-    : t(STATUS_TEXT[status.state]);
+    ? `${t(connectionStatusKey(current, status))} · ${t("verified {0}", [ago(status.handshakeAt)])}`
+    : t(connectionStatusKey(current, status));
   ui($('sidebarConnection'), 'aria-label', () => triggerText);
   ui($('sidebarConnection'), 'title', () => triggerText);
 }
@@ -2073,13 +2115,13 @@ function step(name: string): HTMLElement {
 }
 
 /** What each finished step proves, in the words Ready reads them back with. */
-const READY_CHECKS: Record<string, { done: string; cos?: string }> = {
-  browser: { done: 'Browser connected', cos: 'Signed in to ChatGPT' },
+const READY_CHECKS: Record<string, { done: string; cos?: string; gemini?: string }> = {
+  browser: { done: 'Browser connected', cos: 'Signed in to ChatGPT', gemini: 'Gemini extension connected' },
   folder: { done: 'Folder shared' },
-  access: { done: 'ChatGPT can edit files and run commands' },
+  access: { done: 'ChatGPT can edit files and run commands', gemini: 'Gemini can edit files and run commands' },
   tunnel: { done: 'Tunnel created' },
   key: { done: 'API key stored' },
-  connect: { done: 'Tunnel running' },
+  connect: { done: 'Tunnel running', gemini: 'Local MCP bridge ready' },
   chatgpt: { done: 'Plugin added in ChatGPT' }
 };
 
@@ -2087,13 +2129,17 @@ const READY_CHECKS: Record<string, { done: string; cos?: string }> = {
  * Ready: every check of the steps above, passed or not. All passing says so plainly and offers the
  * chat; anything still open is listed as a way back to its step, never as a failure.
  */
-function paintReady(shown: string[], done: Set<string>, cosBrowser: boolean, allSet: boolean, access: AccessLevel, limited: boolean): void {
+function paintReady(shown: string[], done: Set<string>, cosBrowser: boolean, allSet: boolean, access: AccessLevel, limited: boolean, geminiSelected: boolean): void {
   ui($('readyTitle'), 'textContent', () => allSet ? t('You’re all set!') : t('Almost there'));
   ui($('readyLead'), 'textContent', () => !allSet
     ? t('Finish the steps still open below.')
-    : limited
-      ? t("ChatGPT can now read your folders. Ask it anything in a new chat.")
-      : t('ChatGPT can now work in your folders. Ask it anything in a new chat.'));
+    : geminiSelected
+      ? limited
+        ? t("Gemini can now read your folders through the local MCP bridge. Ask it anything in a new chat.")
+        : t('Gemini can now work in your folders through the local MCP bridge. Ask it anything in a new chat.')
+      : limited
+        ? t("ChatGPT can now read your folders. Ask it anything in a new chat.")
+        : t('ChatGPT can now work in your folders. Ask it anything in a new chat.'));
   // Limited access still ends setup, but never quietly: what is missing, and the way back to change it.
   $('readyLimited').hidden = !limited;
   $('readyStart').hidden = !allSet;
@@ -2106,8 +2152,10 @@ function paintReady(shown: string[], done: Set<string>, cosBrowser: boolean, all
     const row = el('li', `ready-check${passed ? ' is-passed' : ''}${narrowed ? ' is-limited' : ''}`);
     // Limited access is done but says what it leaves out.
     const label = () => narrowed
-      ? t(access === 'read' ? 'ChatGPT can only read files' : "ChatGPT can't edit files or run commands")
-      : t(cosBrowser && check.cos ? check.cos : check.done);
+      ? t(geminiSelected
+        ? access === 'read' ? 'Gemini can only read files' : "Gemini can't edit files or run commands"
+        : access === 'read' ? 'ChatGPT can only read files' : "ChatGPT can't edit files or run commands")
+      : t(geminiSelected && check.gemini ? check.gemini : cosBrowser && check.cos ? check.cos : check.done);
     if (passed) {
       row.append(icon(narrowed ? 'i-warning' : 'i-check-circle'), el('span', '', label));
     } else {
@@ -2382,7 +2430,7 @@ async function dropFolders(event: DragEvent): Promise<void> {
 
 async function toggleConnection(): Promise<void> {
   if (!state || state.status.state === 'disconnecting') return;
-  if (!isRunning(state.status.state) && !(await persistSetupDraftsForConnection())) {
+  if (!selectedConnectionRunning(state) && !(await persistSetupDraftsForConnection())) {
     const missing = state ? missingStep(state) : null;
     // The wizard shows one step at a time: open the one that still needs the person.
     if (missing) openSetupStep(missing.step);
@@ -2390,7 +2438,7 @@ async function toggleConnection(): Promise<void> {
   }
   if (!state) return;
   // Mirrors the button label exactly, so a click always does what it says.
-  const next = await run(isRunning(state.status.state) ? api.disconnect() : api.connect());
+  const next = await run(selectedConnectionRunning(state) ? api.disconnect() : api.connect());
   if (next) apply(next);
 }
 

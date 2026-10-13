@@ -2020,7 +2020,7 @@ describe('session IPC contracts', () => {
     const unattributed = await createSession({ title: 'no conversation', conversationId: null });
     const refused = await handlers.get('sessions:openChat')!(null, { id: unattributed.id }) as any;
     expect(refused.ok).toBe(false);
-    expect(refused.error).toMatch(/no valid ChatGPT conversation/i);
+    expect(refused.error).toMatch(/no valid provider conversation/i);
   });
 });
 

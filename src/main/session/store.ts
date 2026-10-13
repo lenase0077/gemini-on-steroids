@@ -22,6 +22,7 @@
  */
 
 import { modelFacingText } from '../../shared/content-reference.js';
+import { normalizeChatProvider, type ChatProvider } from '../../shared/chat-provider.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { isProModel } from '../../shared/chat-models.js';
 import { constants as fsConstants, promises as fs } from 'node:fs';
@@ -552,6 +553,7 @@ export async function createSession(options: {
   titleSource?: SessionSummary['titleSource'];
   conversationId?: string | null;
   origin?: SessionOrigin | null;
+  provider?: ChatProvider;
 }): Promise<SessionSummary> {
   const id = options.reservedId ?? `${new Date().toISOString().slice(0, 10)}-${randomUUID().slice(0, 8)}`;
   assertSessionId(id);
@@ -562,7 +564,9 @@ export async function createSession(options: {
       return existing;
     }
   }
-  const summary = emptySummary(id, options.title?.trim() || 'ChatGPT session', options.conversationId ?? null);
+  const provider = normalizeChatProvider(options.provider);
+  const summary = emptySummary(id, options.title?.trim() || (provider === 'gemini' ? 'Gemini session' : 'ChatGPT session'), options.conversationId ?? null);
+  summary.provider = provider;
   summary.origin = options.origin ?? null;
   if (options.titleSource) summary.titleSource = options.titleSource;
   if (options.origin?.fromSessionId) {
@@ -2460,6 +2464,8 @@ function normalizeSummary(id: string, raw: string): MetaCheckpoint | null {
         : null;
     const { [META_HISTORY_SEQ]: _historySeq, [META_CANONICAL_PROJECTION]: canonicalProjection, [META_TOKEN_ESTIMATE]: tokenEstimate, ...publicFields } = parsed;
     const publicSummary = publicFields as SessionSummary;
+    // Missing provider is a legacy ChatGPT session, never a cue to infer from a route id or tab.
+    publicSummary.provider = normalizeChatProvider(publicSummary.provider);
     if (publicSummary.retiredChatAt !== undefined) {
       const retired = publicSummary.retiredChatAt;
       publicSummary.retiredChatAt = retired && typeof retired === 'object' && !Array.isArray(retired)

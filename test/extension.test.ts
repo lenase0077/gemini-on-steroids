@@ -54,7 +54,7 @@ describe('extension release metadata', () => {
   it('runs only the fiber and bounded usage readers in the page context', async () => {
     const manifest = JSON.parse(
       await fs.readFile(path.join(process.cwd(), 'extension', 'manifest.json'), 'utf8')
-    ) as { content_scripts: Array<{ js: string[]; world?: string }> };
+    ) as { content_scripts: Array<{ js: string[]; world?: string; matches: string[] }> };
 
     const main = manifest.content_scripts.filter((entry) => entry.world === 'MAIN');
     expect(main).toHaveLength(2);
@@ -66,6 +66,9 @@ describe('extension release metadata', () => {
       expect(entry.js).not.toContain('fiber.js');
       expect(entry.world ?? 'ISOLATED').toBe('ISOLATED');
     }
+    const geminiScripts = manifest.content_scripts.filter((entry) => entry.matches.includes('https://gemini.google.com/*'));
+    expect(geminiScripts).toHaveLength(1);
+    expect(geminiScripts[0]?.js).toEqual(['i18n.js', 'chatgpt-dom.js', 'content.js']);
   });
 
   /**
@@ -224,14 +227,22 @@ interface DomApi {
   errors(): string[];
 }
 
-function loadDom(sections: FakeNode[], pathname = '/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'): DomApi {
+function loadDom(sections: FakeNode[], pathname = '/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', hostname = 'chatgpt.com'): DomApi {
   const document = {
     querySelectorAll: (selector: string) => (selector.split(/,\s*/).includes(TURN_SELECTOR) ? sections : []),
     querySelector: () => null
   };
-  const context = vm.createContext({ document, location: { pathname } });
+  const context = vm.createContext({ document, location: { pathname, hostname } });
   vm.runInContext(domSource, context, { filename: 'chatgpt-dom.js' });
   return (context as unknown as { CLF_DOM: DomApi }).CLF_DOM;
+}
+
+function loadBackgroundUrlFunction(name: string): (value: unknown) => unknown {
+  const start = backgroundSource.indexOf(`function ${name}(`);
+  if (start < 0) throw new Error(`Missing background function ${name}`);
+  const next = backgroundSource.indexOf('\nfunction ', start + 1);
+  const declaration = backgroundSource.slice(start, next < 0 ? undefined : next);
+  return vm.runInNewContext(`${declaration}; ${name}`, { URL }) as (value: unknown) => unknown;
 }
 
 function turn(role: 'user' | 'assistant', id: string): FakeNode {
@@ -277,6 +288,19 @@ describe('ChatGPT DOM adapter', () => {
     expect(loadDom([], `/g/g-p-68abcdef1234/c/${CONVERSATION}`).conversationId()).toBe(CONVERSATION);
     expect(loadDom([], `/share/c/${CONVERSATION}`).conversationId()).toBeNull();
     expect(loadDom([], '/').conversationId()).toBeNull();
+  });
+
+  it('recognises Gemini /app/<16-hex-id> while keeping bare /app unbound', () => {
+    const id = '4f8a9b2c1d3e5f60';
+    const dom = loadDom([], `/app/${id}`, 'gemini.google.com');
+    expect(dom.conversationId()).toBe(id);
+    expect(dom.conversationFromPath('/app')).toBeNull();
+    expect(dom.conversationFromPath('/app/')).toBeNull();
+    expect(dom.conversationFromPath(`/app/${id}/`)).toBe(id);
+    for (const invalid of ['/app/short', '/app/4f8a9b2c1d3e5f6g', '/app/4f8a9b2c1d3e5f601', `/app/${id}/extra`]) {
+      expect(dom.conversationFromPath(invalid), invalid).toBeNull();
+    }
+    expect(loadDom([], `/app/${id}`).conversationFromPath(`/app/${id}`)).toBeNull();
   });
 
   it('groups split assistant sections that share one data-turn-id before counting tool blocks', () => {
@@ -405,6 +429,29 @@ describe('ChatGPT DOM adapter', () => {
     // and a shrink reads as new text to the delta logic, which printed it all over again.
     expect(dom.progressLine(logical)).toBe('Thinking\nReading files\nRunning tool\nRunning tests');
     expect(dom.interrupted(logical)).toBe(true);
+  });
+});
+
+describe('background provider route parsing', () => {
+  it('recognises Gemini app routes without changing ChatGPT conversation identity', () => {
+    const conversationFromUrl = loadBackgroundUrlFunction('conversationFromUrl');
+    const isChatGptUrl = loadBackgroundUrlFunction('isChatGptUrl');
+    const isNewChatUrl = loadBackgroundUrlFunction('isNewChatUrl');
+    const geminiId = '4f8a9b2c1d3e5f60';
+    expect(conversationFromUrl(`https://gemini.google.com/app/${geminiId}`)).toBe(geminiId);
+    expect(conversationFromUrl(`https://gemini.google.com/app/${geminiId}/extra`)).toBeNull();
+    expect(conversationFromUrl('https://gemini.google.com/app')).toBeNull();
+    expect(conversationFromUrl('https://gemini.google.com/app/not-16-hex')).toBeNull();
+    expect(isChatGptUrl('https://gemini.google.com/app')).toBe(true);
+    expect(isChatGptUrl(`https://gemini.google.com/app/${geminiId}`)).toBe(true);
+    expect(isChatGptUrl('https://gemini.google.com/settings')).toBe(false);
+    expect(isNewChatUrl('https://gemini.google.com/app')).toBe(true);
+    expect(isNewChatUrl('https://gemini.google.com/app/')).toBe(true);
+    expect(isNewChatUrl(`https://gemini.google.com/app/${geminiId}`)).toBe(false);
+    expect(conversationFromUrl('https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'))
+      .toBe('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+    expect(isChatGptUrl('https://chatgpt.com/')).toBe(true);
+    expect(isNewChatUrl('https://chatgpt.com/')).toBe(true);
   });
 });
 
@@ -4320,7 +4367,7 @@ describe('extension observation journal', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(postedEvents).toEqual([
-      { conversationId, events: [expect.objectContaining({ kind: 'user_message', text: 'command bootstrap' })] }
+      { conversationId, provider: 'chatgpt', events: [expect.objectContaining({ kind: 'user_message', text: 'command bootstrap' })] }
     ]);
     expect(session.data.commandAckOutbox).toEqual([]);
     expect(journalOf(session)).toEqual([]);
@@ -4484,8 +4531,8 @@ describe('extension observation journal', () => {
     });
 
     expect(posted).toEqual([
-      { conversationId: a, events: [{ kind: 'progress', time: expect.any(Number), text: 'A1' }, { kind: 'progress', time: expect.any(Number), text: 'A2' }] },
-      { conversationId: b, events: [{ kind: 'progress', time: expect.any(Number), text: 'B1' }] }
+      { conversationId: a, provider: 'chatgpt', events: [{ kind: 'progress', time: expect.any(Number), text: 'A1' }, { kind: 'progress', time: expect.any(Number), text: 'A2' }] },
+      { conversationId: b, provider: 'chatgpt', events: [{ kind: 'progress', time: expect.any(Number), text: 'B1' }] }
     ]);
     expect(journalOf(session)).toEqual([]);
   });

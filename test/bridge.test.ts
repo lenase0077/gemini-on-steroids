@@ -9,7 +9,8 @@
 
 import { readFileSync } from 'node:fs';
 import http from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { promises as fs } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { once } from 'node:events';
 import { WebSocket } from 'ws';
@@ -93,6 +94,9 @@ const {
   unpair,
   workerBriefForTests
 } = await import('../src/main/bridge.js');
+const { publishBridgeMcpEndpoint } = await import('../src/main/mcp/bridge-endpoint.js');
+const { startMcpServer } = await import('../src/main/mcp/server.js');
+const { DEFAULT_CAPABILITIES } = await import('../src/shared/types.js');
 const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
 const { setStuckNotifier } = await import('../src/main/stuck-notice.js');
 const {
@@ -308,6 +312,52 @@ function request(
   });
 }
 
+interface McpStubRequest {
+  surface: string;
+  body: Record<string, unknown>;
+  requestId: string | undefined;
+  origin: string | undefined;
+}
+
+async function startMcpBridgeStub(
+  handler: (request: McpStubRequest) => Promise<unknown | null> | unknown | null
+): Promise<{ urls: Record<'core' | 'desktop' | 'plugins', string>; seen: McpStubRequest[]; close: () => Promise<void> }> {
+  const seen: McpStubRequest[] = [];
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      void (async () => {
+        let body: Record<string, unknown>;
+        try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>; }
+        catch { res.writeHead(400).end(); return; }
+        const surface = (req.url ?? '').split('/')[2] ?? '';
+        const item = { surface, body, requestId: req.headers['x-request-id'] as string | undefined, origin: req.headers.origin };
+        seen.push(item);
+        const result = await handler(item);
+        if (result === null) { res.destroy(); return; }
+        const payload = JSON.stringify(result);
+        res.writeHead(200, { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(payload)) });
+        res.end(payload);
+      })().catch(() => { if (!res.destroyed) res.destroy(); });
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('MCP stub did not bind');
+  const urls = Object.fromEntries(['core', 'desktop', 'plugins'].map((surface) =>
+    [surface, `http://127.0.0.1:${address.port}/mcp/${surface}/${surface}-token`])) as Record<'core' | 'desktop' | 'plugins', string>;
+  publishBridgeMcpEndpoint(urls);
+  return {
+    urls,
+    seen,
+    close: async () => {
+      publishBridgeMcpEndpoint(null);
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  };
+}
+
 /**
  * Sends from the prime exactly the way the `agents` tool does.
  *
@@ -410,6 +460,8 @@ beforeEach(async () => {
   });
   resetRecorderForTests();
   writeDurableSoon('bridge-commands', null);
+  await writeDurableNow('mcp-bridge-calls', null);
+  publishBridgeMcpEndpoint(null);
   await flushDurable();
   await setSecret('bridgeToken', '');
   token = null;
@@ -1203,6 +1255,8 @@ describe('authorisation', () => {
     await pair();
     for (const [method, path] of [
       ['GET', '/status'],
+      ['GET', '/mcp-bridge/tools'],
+      ['POST', '/mcp-bridge/call'],
       ['GET', '/activity?conversationId=abcdabcd'],
       ['POST', '/events'],
       ['POST', '/correlations'],
@@ -1225,6 +1279,211 @@ describe('authorisation', () => {
     await pair();
     for (const path of ['/read', '/exec', '/config', '/secrets', '/../config.json']) {
       expect((await request('GET', path)).status, path).toBe(404);
+    }
+  });
+});
+
+describe('MCP-over-DOM bridge gateway', () => {
+  it('returns surface-tagged combined discovery and preserves explicit surface boundaries', async () => {
+    await pair();
+    const stub = await startMcpBridgeStub(({ surface, body }) => ({
+      jsonrpc: '2.0',
+      id: body['id'],
+      result: { tools: [{ name: `${surface}_tool`, inputSchema: { type: 'object' } }] }
+    }));
+    try {
+      const combined = await request('GET', '/mcp-bridge/tools');
+      expect(combined.status).toBe(200);
+      expect(combined.body.surfaces.map((row: { surface: string }) => row.surface)).toEqual(['core', 'desktop', 'plugins']);
+      expect(combined.body.tools.map((row: { surface: string; tool: { name: string } }) => `${row.surface}:${row.tool.name}`))
+        .toEqual(['core:core_tool', 'desktop:desktop_tool', 'plugins:plugins_tool']);
+      const desktop = await request('GET', '/mcp-bridge/tools?surface=desktop');
+      expect(desktop.body).toEqual({ surface: 'desktop', tools: [{ name: 'desktop_tool', inputSchema: { type: 'object' } }] });
+      expect(stub.seen.filter((entry) => entry.body['method'] === 'tools/list').map((entry) => entry.surface))
+        .toEqual(['core', 'desktop', 'plugins', 'desktop']);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it('proves a unique session before dispatch, passes exact request ownership and replays by callId', async () => {
+    await pair();
+    const conversationId = randomUUID().replaceAll('-', '').slice(0, 16);
+    const session = await createSession({ conversationId });
+    let dispatches = 0;
+    const stub = await startMcpBridgeStub(({ body }) => {
+      if (body['method'] === 'tools/list') return { jsonrpc: '2.0', id: body['id'], result: { tools: [] } };
+      dispatches += 1;
+      return { jsonrpc: '2.0', id: body['id'], result: { content: [{ type: 'text', text: 'completed once' }] } };
+    });
+    const call = { callId: 'gemini-message-7-block-0-deadbeef', conversationId, surface: 'core', name: 'read', arguments: { paths: ['/workspace/notes.txt'] } };
+    try {
+      const first = await request('POST', '/mcp-bridge/call', { body: call });
+      expect(first.status).toBe(200);
+      expect(first.body).toEqual({ ok: true, content: [{ type: 'text', text: 'completed once' }] });
+      const second = await request('POST', '/mcp-bridge/call', { body: call });
+      expect(second).toMatchObject({ status: 200, body: first.body });
+      expect(dispatches).toBe(1);
+      const wire = stub.seen.find((entry) => entry.body['method'] === 'tools/call')!;
+      expect(wire.surface).toBe('core');
+      expect(wire.origin).toBe('http://127.0.0.1');
+      expect(wire.requestId).toMatch(/^cosmcp_[a-f0-9]{64}$/);
+      expect(wire.body['params']).toEqual({ name: 'read', arguments: call.arguments });
+      expect(requestCorrelation(wire.requestId)).toMatchObject({ conversationId, sessionId: session.id, tool: 'read' });
+      const conflict = await request('POST', '/mcp-bridge/call', { body: { ...call, arguments: { paths: ['/other'] } } });
+      expect(conflict.status).toBe(409);
+      expect(conflict.body).toEqual({ error: 'call_id_conflict' });
+      expect(dispatches).toBe(1);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it('normalizes MCP tool errors into the DOM bridge response contract', async () => {
+    await pair();
+    const conversationId = randomUUID().replaceAll('-', '').slice(0, 16);
+    await createSession({ conversationId });
+    const stub = await startMcpBridgeStub(({ body }) => ({
+      jsonrpc: '2.0',
+      id: body['id'],
+      result: { content: [{ type: 'text', text: 'tool failed safely' }], isError: true }
+    }));
+    try {
+      const called = await request('POST', '/mcp-bridge/call', {
+        body: { callId: 'tool-error-result', conversationId, surface: 'core', name: 'read', arguments: {} }
+      });
+      expect(called).toMatchObject({
+        status: 200,
+        body: { ok: false, content: [{ type: 'text', text: 'tool failed safely' }], isError: true }
+      });
+      expect(called.body).not.toHaveProperty('result');
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it('uses the live MCP HTTP surface and preserves kernel attribution end to end', async () => {
+    await pair();
+    const conversationId = randomUUID().replaceAll('-', '').slice(0, 16);
+    const session = await createSession({ conversationId });
+    const file = 'bridge-gateway-fixture.txt';
+    await fs.writeFile(`${dir}/${file}`, 'served by the real MCP read tool');
+    const endpoint = await startMcpServer(() => ({
+      roots: [{ name: 'workspace', path: dir }],
+      caps: { ...DEFAULT_CAPABILITIES },
+      readOnly: true,
+      sessionTools: false,
+      agentTools: false
+    }));
+    publishBridgeMcpEndpoint(endpoint.urls);
+    const callId = 'real-mcp-end-to-end';
+    try {
+      const tools = await request('GET', '/mcp-bridge/tools?surface=core');
+      expect(tools.status).toBe(200);
+      expect(tools.body.tools.map((tool: { name: string }) => tool.name)).toContain('read');
+      const called = await request('POST', '/mcp-bridge/call', {
+        body: { callId, conversationId, surface: 'core', name: 'read', arguments: { paths: [`/workspace/${file}`] } }
+      });
+      expect(called.status).toBe(200);
+      expect(called.body.ok).toBe(true);
+      expect(called.body.content.map((item: { text?: string }) => item.text ?? '').join('\n'))
+        .toContain('served by the real MCP read tool');
+      const requestId = `cosmcp_${createHash('sha256').update(`${conversationId}\0${callId}`).digest('hex')}`;
+      expect(requestCorrelation(requestId)).toMatchObject({ conversationId, sessionId: session.id, tool: 'read' });
+      const events = await readEvents(session.id);
+      expect(events.some((event: any) => event.kind === 'tool_call' && event.call?.requestId === requestId &&
+        event.call?.conversationId === conversationId && event.call?.tool === 'read')).toBe(true);
+    } finally {
+      publishBridgeMcpEndpoint(null);
+      await endpoint.stop();
+    }
+  });
+
+  it('joins concurrent duplicate calls and permanently fences an admitted call with a lost upstream response', async () => {
+    await pair();
+    const conversationId = randomUUID().replaceAll('-', '').slice(0, 16);
+    await createSession({ conversationId });
+    let dispatches = 0;
+    const stub = await startMcpBridgeStub(async ({ body }) => {
+      if (body['method'] === 'tools/list') return { jsonrpc: '2.0', id: body['id'], result: { tools: [] } };
+      dispatches += 1;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return { jsonrpc: '2.0', id: body['id'], result: { content: [{ type: 'text', text: 'joined' }] } };
+    });
+    const call = { callId: 'same-in-flight-call', conversationId, surface: 'desktop', name: 'observe', arguments: {} };
+    try {
+      const [first, second] = await Promise.all([
+        request('POST', '/mcp-bridge/call', { body: call }),
+        request('POST', '/mcp-bridge/call', { body: call })
+      ]);
+      expect(first).toMatchObject({ status: 200, body: second.body });
+      expect(dispatches).toBe(1);
+      expect(stub.seen.find((entry) => entry.body['method'] === 'tools/call')?.surface).toBe('desktop');
+    } finally {
+      await stub.close();
+    }
+
+    const lostConversation = randomUUID().replaceAll('-', '').slice(0, 16);
+    await createSession({ conversationId: lostConversation });
+    let lostDispatches = 0;
+    const lost = await startMcpBridgeStub(({ body }) => {
+      if (body['method'] === 'tools/list') return { jsonrpc: '2.0', id: body['id'], result: { tools: [] } };
+      lostDispatches += 1;
+      return null;
+    });
+    const lostCall = { callId: 'ambiguous-response-call', conversationId: lostConversation, surface: 'plugins', name: 'create_file', args: {} };
+    try {
+      expect((await request('POST', '/mcp-bridge/call', { body: lostCall })).status).toBe(503);
+      resetBridgeForTests(); // Reload the durable admission fence as if the process restarted.
+      const retry = await request('POST', '/mcp-bridge/call', { body: lostCall });
+      expect(retry.status).toBe(409);
+      expect(retry.body).toMatchObject({ error: 'call_outcome_unknown', callId: lostCall.callId });
+      expect(lostDispatches).toBe(1);
+    } finally {
+      await lost.close();
+    }
+  });
+
+  it('caps MCP results and stores a terminal bounded response instead of redispatching', async () => {
+    await pair();
+    const conversationId = randomUUID().replaceAll('-', '').slice(0, 16);
+    await createSession({ conversationId });
+    let dispatches = 0;
+    const stub = await startMcpBridgeStub(({ body }) => {
+      dispatches += body['method'] === 'tools/call' ? 1 : 0;
+      const result = body['method'] === 'tools/call'
+        ? { content: [{ type: 'text', text: 'x'.repeat(1024 * 1024 + 8) }] }
+        : { tools: [] };
+      return { jsonrpc: '2.0', id: body['id'], result };
+    });
+    const call = { callId: 'bounded-result-call', conversationId, surface: 'core', name: 'read', arguments: {} };
+    try {
+      const first = await request('POST', '/mcp-bridge/call', { body: call });
+      expect(first.status).toBe(502);
+      expect(first.body).toEqual({ error: 'tool_result_too_large', callId: call.callId });
+      const replay = await request('POST', '/mcp-bridge/call', { body: call });
+      expect(replay).toMatchObject({ status: 502, body: first.body });
+      expect(dispatches).toBe(1);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it('fails closed for missing endpoints, unknown sessions, invalid surfaces and oversized arguments', async () => {
+    await pair();
+    const conversationId = randomUUID().replaceAll('-', '').slice(0, 16);
+    const call = { callId: 'invalid-boundary-call', conversationId, surface: 'core', name: 'read', arguments: {} };
+    expect((await request('GET', '/mcp-bridge/tools')).status).toBe(503);
+    expect((await request('POST', '/mcp-bridge/call', { body: call })).status).toBe(503);
+    const stub = await startMcpBridgeStub(({ body }) => ({ jsonrpc: '2.0', id: body['id'], result: { tools: [] } }));
+    try {
+      expect((await request('POST', '/mcp-bridge/call', { body: call })).body).toEqual({ error: 'unknown_conversation' });
+      expect((await request('GET', '/mcp-bridge/tools?surface=bogus')).status).toBe(400);
+      const oversized = { ...call, arguments: { prompt: 'x'.repeat(1024 * 1024 + 1) } };
+      expect((await request('POST', '/mcp-bridge/call', { body: oversized })).status).toBe(413);
+      expect(stub.seen).toHaveLength(0);
+    } finally {
+      await stub.close();
     }
   });
 });
@@ -3762,6 +4021,18 @@ ${SAMPLE_BRIEF}`)
 });
 
 describe('delivering a bootstrap', () => {
+  it('routes fresh Worker chats through their exact Gemini parent session', async () => {
+    await pair();
+    const parentConversation = randomUUID().replaceAll('-', '').slice(0, 16);
+    await createSession({ conversationId: parentConversation, provider: 'gemini' });
+    spawn({ workers: [{ task: 'inherit the parent provider' }], caller: { conversationId: parentConversation } });
+
+    await waitForOpened(1);
+    const openedUrl = new URL(opened[0]!);
+    expect(openedUrl.origin).toBe('https://gemini.google.com');
+    expect(openedUrl.pathname).toBe('/app');
+  });
+
   async function prepareExpiredDocumentOwnedRevivalRestoreFixture(options: {
     workerConversation: string;
     resumeConversation: string;
@@ -7014,6 +7285,17 @@ ${SAMPLE_BRIEF}` }
     ]);
   });
 
+  it('includes the persisted provider in an extension-owned successor placement', async () => {
+    await pair();
+    const source = 'c0c0c0c0-1111-4222-8333-000000000b04';
+    await createSession({ conversationId: source, provider: 'gemini' });
+
+    const stored = await captureFrom(source);
+
+    expect(stored.body.placement).toMatchObject({ provider: 'gemini', active: true, homeConversationId: source });
+    expect(opened).toEqual([]);
+  });
+
   it('spends the placement on the reply that carries it, so one handoff is one tab', async () => {
     await pair();
     const stored = await captureFrom(HOME);
@@ -7039,6 +7321,18 @@ ${SAMPLE_BRIEF}` }
 
     await waitForOpened(1);
     expect(opened).toEqual([commandUrl(command.id)]);
+  });
+
+  it('routes Compact & Resume through the exact Gemini session provider', async () => {
+    await pair();
+    const source = 'c0c0c0c0-1111-4222-8333-000000000b03';
+    const session = await createSession({ conversationId: source, provider: 'gemini' });
+    const token = await readyContinuation(session.id, 'Continue the Gemini task.', source);
+    queueResume(session.id, token)!;
+
+    await waitForOpened(1);
+    expect(new URL(opened[0]!).origin).toBe('https://gemini.google.com');
+    expect(new URL(opened[0]!).pathname).toBe('/app');
   });
 
   /**

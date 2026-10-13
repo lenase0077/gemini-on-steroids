@@ -1018,8 +1018,9 @@
   let mentionCore = true;
   function sendSubmittedText(stillCurrent, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null,
                              matchesUser = matchesSubmittedUser, receiptTimeoutMs = null, explain = null, mention = currentCoreMention(), sentRequest = null,
-                             whileGenerating = false) {
+                             whileGenerating = false, onSendClick = null) {
     return CLF_DOM.send({ stillCurrent, clearAcceptedDraft, beforeSend, acceptUserReceipt, matchesUser, receiptTimeoutMs, mention, explain, sentRequest, whileGenerating,
+      onSendClick,
       observeEvidence: check => { pageViewChecks.add(check); return () => pageViewChecks.delete(check); } });
   }
   const GOAL_MARKER_INSTRUCTION = '\n\nFor this Goal session only: at the end of each final reply, write exactly one separate last line: [[COS_GOAL:COMPLETE]] if the entire requested task is finished, or [[COS_GOAL:CONTINUE]] if requested work remains. Do not claim completion for partial work. If user input is required, explain it and omit both markers.';
@@ -1477,6 +1478,7 @@
     }
     const queued = {
       conversationId,
+      provider: location.hostname === 'gemini.google.com' ? 'gemini' : 'chatgpt',
       agent,
       agentCommandId,
       event: { time: Date.now(), ...bounded }
@@ -1590,6 +1592,7 @@
       const reply = await ask({
         type: 'events',
         entries: batch,
+        provider: location.hostname === 'gemini.google.com' ? 'gemini' : 'chatgpt',
         projectInput,
         conversationId: conversationId || undefined
       });
@@ -4305,6 +4308,374 @@
     return fiberAsking;
   }
 
+  const GEMINI_MCP_BOOTSTRAP_HEADER = '## Local CoS MCP tools (cos-mcp v1)';
+  const GEMINI_MCP_RESULT_LIMIT = 30_000;
+  const GEMINI_MCP_MAX_CALLS = 16;
+  let geminiMcpTools = null;
+  let geminiMcpToolsFlight = null;
+  const geminiMcpBootstrapCache = new Map();
+  const geminiMcpProcessed = new Set();
+  const geminiMcpBatches = new Set();
+
+  function isGeminiProvider() {
+    return location.hostname === 'gemini.google.com' && /^\/app(?:\/|$)/i.test(String(location.pathname || ''));
+  }
+
+  function readGeminiMcpTools(reply) {
+    if (!reply || reply.ok !== true) return null;
+    const envelope = reply.data?.data ?? reply.data;
+    const source = Array.isArray(envelope) ? envelope :
+      Array.isArray(envelope?.tools) ? envelope.tools : null;
+    if (!source) return null;
+    const tools = [];
+    let serializedSize = 0;
+    for (const candidate of source.slice(0, 160)) {
+      const descriptorSource = candidate?.tool && typeof candidate.tool === 'object' ? candidate.tool : candidate;
+      const surface = candidate?.surface || descriptorSource?.surface;
+      if (!descriptorSource || typeof descriptorSource !== 'object' || !['core', 'desktop', 'plugins'].includes(surface) ||
+          typeof descriptorSource.name !== 'string' || !/^[a-z0-9_.-]{1,64}$/i.test(descriptorSource.name)) continue;
+      const descriptor = {
+        surface,
+        name: descriptorSource.name,
+        description: typeof descriptorSource.description === 'string'
+          ? descriptorSource.description.replace(/[\u0000-\u001f`]/g, ' ').replace(/\s+/g, ' ').slice(0, 400)
+          : ''
+      };
+      if (descriptorSource.inputSchema && typeof descriptorSource.inputSchema === 'object' && !Array.isArray(descriptorSource.inputSchema)) {
+        try {
+          const schema = JSON.stringify(descriptorSource.inputSchema);
+          if (schema.length <= 3_000) descriptor.inputSchema = JSON.parse(schema);
+        } catch { /* Keep the discoverable tool name without an unsafe/broken schema. */ }
+      }
+      const size = JSON.stringify(descriptor).length;
+      if (tools.length >= 100 || serializedSize + size > 22_000) break;
+      tools.push(descriptor);
+      serializedSize += size;
+    }
+    return tools;
+  }
+
+  async function loadGeminiMcpTools(current = () => true) {
+    if (Array.isArray(geminiMcpTools)) return geminiMcpTools;
+    if (geminiMcpToolsFlight) return geminiMcpToolsFlight;
+    geminiMcpToolsFlight = (async () => {
+      const reply = await ask({ type: 'mcp_bridge_tools' }, current);
+      if (!current()) return null;
+      const tools = readGeminiMcpTools(reply);
+      if (tools) geminiMcpTools = tools;
+      return tools;
+    })().finally(() => { geminiMcpToolsFlight = null; });
+    return geminiMcpToolsFlight;
+  }
+
+  async function withGeminiMcpBootstrap(text, cacheKey, current = () => true) {
+    const original = String(text || '');
+    if (!isGeminiProvider() || !CLF_DOM.isNewChatPage?.() || original.includes(GEMINI_MCP_BOOTSTRAP_HEADER)) return original;
+    if (cacheKey && geminiMcpBootstrapCache.has(cacheKey)) {
+      const block = geminiMcpBootstrapCache.get(cacheKey);
+      return block ? `${original}${original ? '\n\n' : ''}${block}` : original;
+    }
+    const tools = await loadGeminiMcpTools(current);
+    if (!current()) return null;
+    if (!tools || tools.length === 0) {
+      if (cacheKey) geminiMcpBootstrapCache.set(cacheKey, '');
+      return original;
+    }
+    const toolJson = JSON.stringify(tools).replace(/`/g, '\\u0060');
+    const block = `${GEMINI_MCP_BOOTSTRAP_HEADER}\n` +
+      'Use only the listed local tools when useful. Emit each request as one complete `cos-mcp` fenced JSON block, or a `json` fenced block whose call object includes `"cos_mcp": true`; include `{ "surface", "name", "arguments" }`. Do not claim a tool ran until a `cos-mcp-result` arrives.\n' +
+      'Example:\n```cos-mcp\n{"surface":"core","name":"tool_name","arguments":{}}\n```\n' +
+      'JSON-compatible example:\n```json\n{"cos_mcp":true,"surface":"core","name":"tool_name","arguments":{}}\n```\n' +
+      `Available tools (JSON):\n${toolJson}`;
+    if (cacheKey) {
+      geminiMcpBootstrapCache.set(cacheKey, block);
+      while (geminiMcpBootstrapCache.size > 128) geminiMcpBootstrapCache.delete(geminiMcpBootstrapCache.keys().next().value);
+    }
+    return `${original}${original ? '\n\n' : ''}${block}`;
+  }
+
+  function parseGeminiMcpFences(text) {
+    const lines = String(text || '').slice(0, 256_000).split(/\r?\n/);
+    const blocks = [];
+    let fence = null;
+    let fenceIndex = 0;
+    for (const line of lines) {
+      if (!fence) {
+        const opening = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+        if (!opening) continue;
+        fence = { marker: opening[1][0], length: opening[1].length, info: opening[2].trim(), index: fenceIndex++, body: [], size: 0, oversized: false, markerSeen: false };
+        continue;
+      }
+      const markerPattern = fence.marker === '`' ? '\\x60' : '~';
+      const closing = new RegExp(`^ {0,3}${markerPattern}{${fence.length},}\\s*$`).test(line);
+      if (!closing) {
+        if (/^\s*\/\/\s*cos-mcp(?:\s|$)/i.test(line) || /"cos_mcp"\s*:\s*true\b/i.test(line)) fence.markerSeen = true;
+        fence.size += line.length + 1;
+        if (fence.size <= 64_000) fence.body.push(line);
+        else fence.oversized = true;
+        continue;
+      }
+      const body = fence.oversized ? '' : fence.body.join('\n').trim();
+      if (fence.info === 'cos-mcp' || (fence.info === 'json' && (fence.markerSeen || (!fence.oversized && hasGeminiMcpMarker(body))))) blocks.push({
+        index: fence.index,
+        text: body,
+        oversized: fence.oversized,
+        marked: fence.info === 'cos-mcp' || /^\/\/\s*cos-mcp(?:\s|$)/i.test(body) || /"cos_mcp"\s*:\s*true\b/i.test(body)
+      });
+      fence = null;
+    }
+    return blocks;
+  }
+
+  function geminiMcpBlocksFromMessage(message, node) {
+    const blocks = parseGeminiMcpFences(message?.rawText || '');
+    if (!node?.querySelectorAll) return blocks;
+    const textOccurrences = new Map();
+    for (const block of blocks) {
+      if (block.oversized) continue;
+      textOccurrences.set(block.text, (textOccurrences.get(block.text) || 0) + 1);
+    }
+    let domIndex = 0;
+    const candidates = typeof CLF_DOM.mcpCodeBlocks === 'function'
+      ? CLF_DOM.mcpCodeBlocks(node)
+      : [...node.querySelectorAll('pre > code')].map((code, index) => ({
+        index,
+        text: typeof code.textContent === 'string' ? code.textContent.trim() : '',
+        marked: [...(code.classList || [])].includes('language-cos-mcp')
+      }));
+    for (const candidate of candidates) {
+      if (domIndex >= GEMINI_MCP_MAX_CALLS) break;
+      const index = 256_000 + domIndex++;
+      const raw = typeof candidate?.text === 'string' ? candidate.text : '';
+      const text = raw.trim();
+      const matchingTextBlock = textOccurrences.get(text) || 0;
+      if (matchingTextBlock > 0) {
+        textOccurrences.set(text, matchingTextBlock - 1);
+        continue;
+      }
+      const oversized = raw.length > 64_000;
+      const commentMarked = /^\/\/\s*cos-mcp(?:\s|$)/i.test(text);
+      if (!candidate?.marked && !oversized && !hasGeminiMcpMarker(text)) continue;
+      blocks.push({ index, text: oversized ? '' : text, oversized, marked: candidate?.marked === true || commentMarked });
+    }
+    return blocks;
+  }
+
+  function hasGeminiMcpMarker(text) {
+    const source = String(text || '').trim();
+    if (/^\/\/\s*cos-mcp(?:\s|$)/i.test(source)) return true;
+    if (/"cos_mcp"\s*:\s*true\b/i.test(source)) return true;
+    try {
+      const value = JSON.parse(source);
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+      const call = value.call && typeof value.call === 'object' && !Array.isArray(value.call) ? value.call : value;
+      return value.cos_mcp === true || call.cos_mcp === true;
+    } catch { return false; }
+  }
+
+  function stableGeminiMcpHash(value) {
+    let left = 0x811c9dc5;
+    let right = 0x9e3779b9;
+    const text = String(value || '');
+    for (let index = 0; index < text.length; index++) {
+      const code = text.charCodeAt(index);
+      left = Math.imul(left ^ code, 0x01000193);
+      right = Math.imul(right ^ (code + index), 0x85ebca6b);
+    }
+    return `${(left >>> 0).toString(16).padStart(8, '0')}${(right >>> 0).toString(16).padStart(8, '0')}`;
+  }
+
+  function parseGeminiMcpCall(block) {
+    if (block.oversized) return { error: 'request_too_large' };
+    let source = String(block.text || '').trim();
+    const comment = /^\/\/\s*cos-mcp(?:\s|$)\s*/i.exec(source);
+    if (comment) source = source.slice(comment[0].length).trim();
+    const clearlyMarked = block.marked === true || comment !== null || /"cos_mcp"\s*:\s*true\b/i.test(source);
+    let value;
+    try { value = JSON.parse(source); }
+    catch (error) {
+      if (clearlyMarked) {
+        const detail = String(error?.message || 'JSON syntax error').replace(/[\u0000-\u001f]/g, ' ').slice(0, 300);
+        return { error: `Invalid JSON in cos-mcp block: ${detail}. Please re-emit valid JSON.` };
+      }
+      return { error: 'invalid_json' };
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return { error: 'invalid_call' };
+    const wrapped = value.call && typeof value.call === 'object' && !Array.isArray(value.call) ? value.call : value;
+    const marked = comment !== null || value.cos_mcp === true || wrapped.cos_mcp === true;
+    if (!block.marked && !marked) return { error: 'missing_cos_mcp_marker' };
+    if (Object.keys(value).some(key => !['cos_mcp', 'surface', 'name', 'arguments', 'callId', 'call'].includes(key)) ||
+        Object.keys(wrapped).some(key => !['cos_mcp', 'surface', 'name', 'arguments', 'callId'].includes(key)) ||
+        !['core', 'desktop', 'plugins'].includes(wrapped.surface) ||
+        typeof wrapped.name !== 'string' || !/^[a-z0-9_.-]{1,64}$/i.test(wrapped.name) ||
+        !wrapped.arguments || typeof wrapped.arguments !== 'object' || Array.isArray(wrapped.arguments) ||
+        (wrapped.callId !== undefined && (typeof wrapped.callId !== 'string' || !/^[a-z0-9._:-]{1,128}$/i.test(wrapped.callId)))) {
+      return { error: 'invalid_call' };
+    }
+    let argsSize;
+    try { argsSize = JSON.stringify(wrapped.arguments).length; } catch { return { error: 'invalid_arguments' }; }
+    if (argsSize > 64_000) return { error: 'arguments_too_large' };
+    return { surface: wrapped.surface, name: wrapped.name, arguments: wrapped.arguments, ...(typeof wrapped.callId === 'string' ? { callId: wrapped.callId } : {}) };
+  }
+
+  function boundedGeminiMcpResult(results) {
+    const chunks = [];
+    const truncationNotice = '\n\n[truncated]';
+    let remaining = GEMINI_MCP_RESULT_LIMIT - truncationNotice.length;
+    let truncated = false;
+    for (const result of results) {
+      if (remaining <= 0) { truncated = true; break; }
+      const prefix = `${chunks.length ? '\n\n' : ''}` + '```cos-mcp-result\n';
+      const suffix = '\n```';
+      const base = { callId: result.callId, surface: result.surface || null, name: result.name || null,
+        ok: result.ok === true, ...(result.error ? { error: result.error } : {}) };
+      const output = String(result.output || '');
+      const encode = value => `${prefix}${JSON.stringify({ ...base, result: value })}${suffix}`;
+      let chunk = encode(output);
+      if (chunk.length > remaining) {
+        truncated = true;
+        const marker = '\n[truncated]';
+        let low = 0, high = output.length;
+        while (low < high) {
+          const middle = Math.ceil((low + high) / 2);
+          if (encode(`${output.slice(0, middle)}${marker}`).length <= remaining) low = middle;
+          else high = middle - 1;
+        }
+        chunk = encode(`${output.slice(0, low)}${marker}`);
+        if (chunk.length > remaining) break;
+        chunks.push(chunk);
+        remaining -= chunk.length;
+        break;
+      }
+      chunks.push(chunk);
+      remaining -= chunk.length;
+    }
+    const joined = chunks.join('');
+    return `${joined}${truncated ? truncationNotice : ''}`.slice(0, GEMINI_MCP_RESULT_LIMIT);
+  }
+
+  function geminiMcpReplyText(reply) {
+    if (!reply || reply.ok !== true) return { ok: false, error: String(reply?.error || 'bridge_unavailable'), output: String(reply?.error || 'Bridge request failed.') };
+    const envelope = reply.data?.data ?? reply.data;
+    const result = envelope?.result ?? envelope;
+    if (!result || typeof result !== 'object') return { ok: false, error: 'invalid_bridge_result', output: 'The local bridge returned no tool result.' };
+    const parts = [];
+    if (typeof result.stdout === 'string') parts.push(result.stdout);
+    if (typeof result.stderr === 'string') parts.push(result.stderr);
+    if (typeof result.output === 'string') parts.push(result.output);
+    if (!parts.length && Array.isArray(result.content)) {
+      for (const item of result.content.slice(0, 100)) {
+        if (item && item.type === 'text' && typeof item.text === 'string') parts.push(item.text);
+        else if (item && typeof item === 'object') parts.push(JSON.stringify(item));
+      }
+    }
+    if (!parts.length) {
+      if (typeof result.error === 'string') parts.push(result.error);
+      else try { parts.push(JSON.stringify(result.structuredContent ?? result)); }
+      catch { parts.push('[unserializable tool result]'); }
+    }
+    const succeeded = result.ok !== false && result.isError !== true && reply.status >= 200 && reply.status < 300;
+    const error = typeof result.error === 'string' ? result.error : result.isError === true || result.ok === false ? 'tool_error' : null;
+    return { ok: succeeded, ...(error ? { error } : {}), output: parts.join('\n').slice(0, 60_000) };
+  }
+
+  function geminiMcpConversationCurrent(owner) {
+    return alive && isGeminiProvider() && epoch === owner.epoch && conversationId === owner.conversationId &&
+      CLF_DOM.conversationId() === owner.conversationId && !desktopInputBusy && !modelCatalogBusy &&
+      !pluginRefreshBusy && !desktopDecision && !commandAttempt && !stopRequestedAt;
+  }
+
+  function geminiMcpAssistantCurrent(owner) {
+    const latest = CLF_DOM.messages().at(-1);
+    return geminiMcpConversationCurrent(owner) && !generating && !CLF_DOM.generating() && pendingTools === 0 &&
+      latest?.role === 'assistant' && latest.id === owner.messageId &&
+      CLF_DOM.composerVisible() && CLF_DOM.composerWritable() && !CLF_DOM.hasComposerAttachments();
+  }
+
+  function geminiMcpOwnerCurrent(owner) {
+    return geminiMcpAssistantCurrent(owner) && !CLF_DOM.composerAuthoredText().trim();
+  }
+
+  async function dispatchGeminiMcpFinal(turns, scanToken, ownerEpoch, ownerConversation) {
+    if (!isGeminiProvider() || typeof scanToken !== 'string' || !scanToken || !ownerConversation || ownerEpoch !== epoch || ownerConversation !== conversationId ||
+        CLF_DOM.conversationId() !== ownerConversation || generating || CLF_DOM.generating()) return;
+    const latest = CLF_DOM.messages().at(-1);
+    if (!latest || latest.role !== 'assistant') return;
+    let final = null;
+    for (const turn of [...(Array.isArray(turns) ? turns : [])].reverse()) {
+      if (!turn?.endMessageId) continue;
+      const message = (turn.messages || []).find(item => item?.role === 'assistant' && item.stable === true &&
+        (item.rawMessageId === turn.endMessageId || item.messageId === turn.endMessageId));
+      if (message && latest.id === (message.rawMessageId || message.messageId)) { final = { turn, message }; break; }
+    }
+    if (!final || latest.node?.getAttribute?.('data-clf-fiber-turn') !== `${scanToken}:${final.turn.index}`) return;
+    const blocks = geminiMcpBlocksFromMessage(final.message, latest.node);
+    if (!blocks.length) return;
+    const owner = { epoch: ownerEpoch, conversationId: ownerConversation, messageId: latest.id };
+    if (!geminiMcpOwnerCurrent(owner)) return;
+    const batchKey = `${ownerConversation}\u0000${owner.messageId}`;
+    if (geminiMcpBatches.has(batchKey)) return;
+    const tools = await loadGeminiMcpTools(() => geminiMcpOwnerCurrent(owner));
+    if (!geminiMcpOwnerCurrent(owner) || !tools) return;
+    const outputs = [];
+    geminiMcpBatches.add(batchKey);
+    while (geminiMcpBatches.size > 2000) geminiMcpBatches.delete(geminiMcpBatches.values().next().value);
+    for (const block of blocks.slice(0, GEMINI_MCP_MAX_CALLS)) {
+      if (!geminiMcpOwnerCurrent(owner)) return;
+      const blockHash = stableGeminiMcpHash(block.text || `${block.index}:oversized`);
+      const key = `${ownerConversation}\u0000${owner.messageId}\u0000${block.index}\u0000${blockHash}`;
+      if (geminiMcpProcessed.has(key)) continue;
+      geminiMcpProcessed.add(key);
+      while (geminiMcpProcessed.size > 2000) geminiMcpProcessed.delete(geminiMcpProcessed.values().next().value);
+      const call = parseGeminiMcpCall(block);
+      const callId = typeof call.callId === 'string' ? call.callId : `gemini-${stableGeminiMcpHash(`${key}\u0000${block.text}`)}`;
+      if (call.error) {
+        outputs.push({ callId, ok: false, error: call.error,
+          output: call.error.startsWith('Invalid JSON in cos-mcp block:') ? call.error : `The request was not executed: ${call.error}.` });
+        continue;
+      }
+      if (!tools.some(tool => tool.surface === call.surface && tool.name === call.name)) {
+        outputs.push({ callId, surface: call.surface, name: call.name, ok: false,
+          error: 'tool_not_listed', output: 'The requested tool is not in the current enabled tool catalog.' });
+        continue;
+      }
+      const reply = await ask({ type: 'mcp_bridge_call', surface: call.surface, name: call.name,
+        arguments: call.arguments, conversationId: ownerConversation, callId,
+        ...(agent && agentCommandId ? { agentCommandId } : {}) }, () => geminiMcpOwnerCurrent(owner));
+      if (!geminiMcpOwnerCurrent(owner)) return;
+      const result = geminiMcpReplyText(reply);
+      outputs.push({ callId, surface: call.surface, name: call.name, ...result });
+    }
+    if (blocks.length > GEMINI_MCP_MAX_CALLS) {
+      outputs.push({ callId: `gemini-${stableGeminiMcpHash(`${batchKey}:limit`)}`, ok: false,
+        error: 'too_many_calls', output: `Only the first ${GEMINI_MCP_MAX_CALLS} tool requests were considered.` });
+    }
+    if (!outputs.length || !geminiMcpOwnerCurrent(owner)) return;
+    const response = boundedGeminiMcpResult(outputs);
+    if (!response || response.length > GEMINI_MCP_RESULT_LIMIT || !geminiMcpOwnerCurrent(owner)) return;
+    if (!CLF_DOM.insertPrompt(response, true)) return;
+    const draft = CLF_DOM.captureComposerDraft(response, () => geminiMcpConversationCurrent(owner));
+    try {
+      let clickIssued = false;
+      const sendCurrent = () => geminiMcpConversationCurrent(owner) && (clickIssued || draft.current());
+      const sent = await CLF_DOM.send({
+        acceptanceTimeoutMs: 15_000,
+        stillCurrent: sendCurrent,
+        beforeSend: async current => {
+          if (current() !== true || !geminiMcpAssistantCurrent(owner) || !draft.current()) return false;
+          clickIssued = true;
+          return true;
+        },
+        matchesUser: (user, expected) => sendText(user?.text) === sendText(expected),
+        acceptUserReceipt: (user, conversation) => geminiMcpConversationCurrent(owner) &&
+          conversation === ownerConversation && sendText(user?.text) === sendText(response)
+      });
+      if (!sent && draft.current()) await draft.clear();
+    } finally {
+      draft.dispose?.();
+    }
+  }
+
   /**
    * Refreshes the cache. `null` means no answer — keep whatever was last known.
    *
@@ -4438,6 +4809,7 @@
       const reply = await ask({
         type: 'correlate',
         conversationId: ownerConversation,
+        provider: location.hostname === 'gemini.google.com' ? 'gemini' : 'chatgpt',
         calls: batch,
         agent: agent || pendingWorker?.agent || null,
         agentCommandId: agentCommandId || pendingWorker?.commandId || null,
@@ -5128,6 +5500,7 @@
       }
     }
     if (userAuthoredTimesReported.size > 4000) userAuthoredTimesReported.clear();
+    if (isGeminiProvider()) void dispatchGeminiMcpFinal(answer.turns, answer.scanToken, askedEpoch, askedConversation);
     // observe() starts this asynchronous scan before its own flush. A final Fiber reply may
     // therefore be the last producer after that flush has already finished. Transfer its
     // canonical revisions now instead of waiting for visibilitychange or the next timer.
@@ -11892,6 +12265,20 @@
     )));
     if (await failIfRetargeted()) return;
 
+    if (!target && isGeminiProvider() && (boot.type === 'resume' || boot.type === 'worker') && CLF_DOM.isNewChatPage()) {
+      const bootstrapCurrent = () => stillOnTarget() && CLF_DOM.isNewChatPage() &&
+        !generating && !CLF_DOM.generating() && CLF_DOM.composerVisible() && CLF_DOM.composerWritable() &&
+        !CLF_DOM.composerAuthoredText().trim() && !CLF_DOM.hasComposerAttachments();
+      const bootstrapped = await withGeminiMcpBootstrap(boot.text, `command:${boot.id}`, bootstrapCurrent);
+      if (bootstrapped === null || !bootstrapCurrent()) {
+        return void (await fail(t(
+          'content_bootstrap_fresh_chat_changed',
+          'the marked fresh chat changed before tool discovery; nothing was sent'
+        )));
+      }
+      boot.text = bootstrapped;
+    }
+
     if (boot.model || boot.reasoningEffort) step('model');
     if ((boot.model || boot.reasoningEffort) && !(await CLF_DOM.selectModelSettings(boot.model, boot.reasoningEffort, stillOnTarget))) {
       return void (await fail(t(
@@ -12597,6 +12984,15 @@
     try { sessionStorage.setItem(SERVED_PLANNER_STORAGE, JSON.stringify(servedPlanner)); } catch { /* Memory still holds it. */ }
   }
   let desktopInputBusy = false;
+  // A successful native click is one-way even when Gemini routes /app to /app/:id before
+  // its user-query becomes readable. Do not let a repeated service-worker offer send it again.
+  const desktopInputSendAttempts = new Set();
+  function rememberDesktopInputSend(id) {
+    if (typeof id !== 'string' || !id) return;
+    desktopInputSendAttempts.delete(id);
+    desktopInputSendAttempts.add(id);
+    while (desktopInputSendAttempts.size > 512) desktopInputSendAttempts.delete(desktopInputSendAttempts.values().next().value);
+  }
   /**
    * How long an app-owned Send waits for its exact user row after the click. Without a bound,
    * a row the page reads back differently (#821: `&#x20;` for a space) kept this document's
@@ -12794,8 +13190,11 @@
 
   async function acceptDesktopInput(message) {
     const silencePickup = typeof message.silenceTurnId === 'string';
+    const gemini = isGeminiProvider();
+    const requestedProvider = message.provider === 'gemini' ? 'gemini' : 'chatgpt';
+    if (requestedProvider !== (gemini ? 'gemini' : 'chatgpt') || desktopInputSendAttempts.has(message.id)) return false;
     let sourceQuiet = silencePickup;
-    if (desktopInputBusy || modelCatalogBusy || !alive || (generating && !message.directTurn && !silencePickup) || (pendingTools > 0 && !message.directTurn) || goalBusy || job?.busy) return false;
+    if (desktopInputBusy || (!gemini && modelCatalogBusy) || !alive || (generating && !message.directTurn && !silencePickup) || (pendingTools > 0 && !message.directTurn) || goalBusy || job?.busy) return false;
     const target = message.conversationId || null;
     const forEpoch = epoch;
     const sourceTurn = turnId;
@@ -12879,7 +13278,7 @@
       const url = new URL(location.href);
       return url.searchParams.get('cos-input') === message.id || new URLSearchParams(url.hash.slice(1)).get('cos-input') === message.id;
     };
-    const ownsFreshPage = () => !target && onTarget() && (project ? CLF_DOM.projectHomeId() === project : location.pathname === '/') &&
+    const ownsFreshPage = () => !target && onTarget() && (project ? CLF_DOM.projectHomeId() === project : CLF_DOM.isNewChatPage()) &&
       (project ? freshMarker() : new URL(location.href).searchParams.get('cos-input') === message.id) && !CLF_DOM.turns().length;
     if (!target && !ownsFreshPage()) return false;
     desktopInputBusy = true;
@@ -12932,6 +13331,16 @@
         const why = target && deletedConversations.has(target.toLowerCase()) ? CONVERSATION_DELETED : error;
         await ask({ type: 'desktop_input', id: input.id, owner: input.owner, fail: true, error: why }); return false;
       };
+      if (input.opening === true && !target && isGeminiProvider() && ownsFreshPage()) {
+        const bootstrapCurrent = () => ownsFreshPage() && !CLF_DOM.generating() && CLF_DOM.composerVisible() &&
+          CLF_DOM.composerWritable() && !CLF_DOM.composerAuthoredText().trim() && !CLF_DOM.hasComposerAttachments();
+        const bootstrapKey = typeof input.sessionId === 'string' && input.sessionId
+          ? `session:${input.sessionId}`
+          : `input:${input.id}`;
+        const bootstrapped = await withGeminiMcpBootstrap(input.text, bootstrapKey, bootstrapCurrent);
+        if (bootstrapped === null || !bootstrapCurrent()) return fail('The fresh Gemini chat changed before tool discovery.');
+        input.text = bootstrapped;
+      }
       // ChatGPT restores its shared home draft even in a newly opened input tab.
       // This exact claimed bootstrap owns replacement text; existing chats and
       // attachment drafts remain protected. Re-evaluate after model selection,
@@ -12989,7 +13398,7 @@
       const providerLimitation = () => CLF_DOM.errors().find(error => error.blocking === true)?.text;
       const limitation = providerLimitation();
       if (limitation) return fail(limitation);
-      if (!intoRunningTurn() && !(await CLF_DOM.selectModelSettings(input.model, input.reasoningEffort, onTarget))) return fail(
+      if (!gemini && !intoRunningTurn() && !(await CLF_DOM.selectModelSettings(input.model, input.reasoningEffort, onTarget))) return fail(
         providerLimitation() || t(
           'content_delivery_model_unconfirmed',
           'Requested model or reasoning could not be confirmed'
@@ -13100,7 +13509,7 @@
       // ChatGPT switches its own image tool off for a message that mentions an app).
       input.purpose === 'decision' || (input.coreMention === false && !input.recovery && !agent) ? null
         : input.recovery || agent || mentionCore ? currentCoreMention() : null,
-      sentRequestSince, !!message.directTurn);
+      sentRequestSince, !!message.directTurn, () => rememberDesktopInputSend(input.id));
       // #744: one retry when the editor was replaced before anything asked to send it.
       if (!(await nativeSend()) &&
           !(!authorizing && !sendAttempted && !receipt && !draft.current() && draftCurrent() && await nativeSend())) {
@@ -13441,16 +13850,18 @@
   }
   function inputReuseSafe() {
     const rows = CLF_DOM.messages();
-    const home = !CLF_DOM.conversationId() && location.pathname === '/';
+    const home = CLF_DOM.isNewChatPage();
     const marker = new URL(location.href).searchParams;
+    const gemini = isGeminiProvider();
     return alive && !generating && !CLF_DOM.generating() && pendingTools === 0 && !desktopInputBusy &&
-      !modelCatalogBusy && !pluginRefreshBusy && !desktopDecision && !commandAttempt && !commandJournalGate &&
-      queue.length === 0 && !flushWork && CLF_DOM.composerVisible() && !CLF_DOM.hasComposerAttachments() &&
+      (gemini || (!modelCatalogBusy && !pluginRefreshBusy)) && !desktopDecision && !commandAttempt && !commandJournalGate &&
+      queue.length === 0 && !flushWork && CLF_DOM.composerVisible() && (!gemini || CLF_DOM.composerWritable()) && !CLF_DOM.hasComposerAttachments() &&
       !(CLF_DOM.composer()?.textContent || '').trim() &&
       (home ? !rows.length && !marker.has('cos-input') && !marker.has('temporary-chat') :
         !!CLF_DOM.conversationId() && rows.at(-1)?.role === 'assistant');
   }
   async function prepareDesktopInputPage(message) {
+    if ((message.provider === 'gemini') !== isGeminiProvider()) return { ready: false };
     if (!/^[a-f0-9-]{36}$/i.test(message.id) || !inputReuseSafe()) return { ready: false };
     const startEpoch = epoch, startConversation = CLF_DOM.conversationId();
     let interrupted = false;
@@ -13468,14 +13879,15 @@
         const control = await CLF_DOM.newChatControl(current);
         if (!control || !current()) return failure();
         control.click();
-        const home = await waitPageView(() => !CLF_DOM.conversationId() && location.pathname === '/' && !CLF_DOM.turns().length, current, 5000);
+        const home = await waitPageView(() => CLF_DOM.isNewChatPage() && !CLF_DOM.turns().length, current, 5000);
         if (!home || !current()) return failure();
       }
-      if (!(await CLF_DOM.prepareChatModelSurface(current)) || !current()) return failure();
+      if (!isGeminiProvider() && (!(await CLF_DOM.prepareChatModelSurface(current)) || !current())) return failure();
       // A mounted editor can belong to a hidden/alternate surface. Do not stamp
       // it ready and strand the input there; the existing pre-send fallback owns
       // a clean New Chat when the native transition did not produce a usable one.
-      if (location.pathname !== '/' || CLF_DOM.conversationId() || CLF_DOM.turns().length || !CLF_DOM.composerVisible()) return failure();
+      if (!CLF_DOM.isNewChatPage() || CLF_DOM.turns().length || !CLF_DOM.composerVisible() ||
+          (isGeminiProvider() && !CLF_DOM.composerWritable())) return failure();
       const url = new URL(location.href);
       url.searchParams.delete('cos-model-catalog');
       url.searchParams.set('cos-input', message.id);
@@ -13958,7 +14370,12 @@
       desktopInputBusyForTest: () => desktopInputBusy,
       setShowTimes: (on) => {
         SHOW_TIMES = on === true;
-      }
+      },
+      parseGeminiMcpFences,
+      parseGeminiMcpCall,
+      boundedGeminiMcpResult,
+      geminiMcpBlocksFromMessageForTest: geminiMcpBlocksFromMessage,
+      withGeminiMcpBootstrapForTest: withGeminiMcpBootstrap
     });
   }
 })();

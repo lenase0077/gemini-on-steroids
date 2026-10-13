@@ -3,11 +3,15 @@ import { connect, getStatus, onStatusChange } from '../connection.js';
 import { startBridge } from '../bridge.js';
 import { wakeBrowserUrl, resetBrowserStartupForTests } from '../browser-startup.js';
 import { getConfig } from '../config.js';
+import { conversationUrl, newChatUrl, normalizeChatProvider } from '../../shared/chat-provider.js';
 import { enqueueInput, cancelInput, listInputs, noteInputStartupError, type InputArgs, type InputEntry } from './input.js';
 
 function wakeBrowser(entry: InputEntry, retry = false): Promise<void> {
   const marker = `cos-input=${encodeURIComponent(entry.id)}`;
-  return wakeBrowserUrl(entry.conversationId ? `https://chatgpt.com/c/${encodeURIComponent(entry.conversationId)}` : `https://chatgpt.com/?${marker}#${marker}`, retry, getConfig().ui.backgroundChats === true);
+  const provider = normalizeChatProvider(entry.provider);
+  const base = entry.conversationId ? conversationUrl(provider, entry.conversationId) : newChatUrl(provider);
+  const url = entry.conversationId ? base : `${base}?${marker}#${marker}`;
+  return wakeBrowserUrl(url, retry, getConfig().ui.backgroundChats === true);
 }
 /**
  * Connection setup, not the browser, stopped this send (#882 VM test, 2026-10-04: a fresh install
@@ -20,8 +24,8 @@ class SetupNotReady extends Error {}
 const startupError = (error: unknown): string =>
   (error instanceof SetupNotReady ? SETUP_PREFIX : BROWSER_PREFIX) + (error as Error).message;
 
-async function ready(signal?: AbortSignal): Promise<void> {
-  await connect();
+async function ready(provider: InputEntry['provider'], signal?: AbortSignal): Promise<void> {
+  await connect(provider);
   signal?.throwIfAborted();
   // startTunnel returns a lifecycle handle before OpenAI /readyz or cloudflared's URL.
   // Await the existing status authority before browser work; local admission is already durable.
@@ -35,7 +39,7 @@ async function ready(signal?: AbortSignal): Promise<void> {
       const status = getStatus();
       if (['starting-server', 'connecting-tunnel', 'offline'].includes(status.state)) return;
       clearTimeout(timer); unsubscribe(); signal?.removeEventListener('abort', abort);
-      if (status.state === 'connected') resolve();
+      if (provider === 'gemini' ? status.localMcpReady === true : status.state === 'connected') resolve();
       else reject(new SetupNotReady(status.detail || 'Finish connection setup before sending.'));
     };
     unsubscribe = onStatusChange(inspect); inspect();
@@ -62,7 +66,7 @@ export async function cancelDesktopInput(id: string): Promise<boolean> {
 }
 async function startAcceptedInput(entry: InputEntry, controller: AbortController): Promise<void> {
   try {
-    await ready(controller.signal);
+    await ready(entry.provider, controller.signal);
     controller.signal.throwIfAborted();
     const current = (await listInputs()).find(row => row.id === entry.id);
     controller.signal.throwIfAborted();
@@ -104,8 +108,9 @@ export async function retryQueuedInputBrowser(id: string): Promise<InputEntry | 
   try {
     const repaired = await noteInputStartupError(id, null);
     if (repaired?.error?.startsWith('Local chat setup failed:')) return repaired;
-    await ready(controller.signal);
     const entry = (await listInputs()).find(row => row.id === id);
+    if (!entry) return null;
+    await ready(entry.provider, controller.signal);
     controller.signal.throwIfAborted();
     return entry?.state === 'queued' ? await deliver(entry, true) : null;
   } catch (error) {

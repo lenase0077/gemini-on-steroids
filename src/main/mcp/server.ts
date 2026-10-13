@@ -28,6 +28,7 @@ import { getConfig } from '../config.js';
 import { logError, logInfo, logWarn } from '../logger.js';
 import { buildServer, resetToolClock, type ToolContext } from './tools.js';
 import { SURFACE_IDS, configuredConnectorName, type SurfaceId } from './surfaces.js';
+import { publishLocalBridgeToken } from './bridge-endpoint.js';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 
@@ -268,6 +269,8 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
   resetToolClock();
   selfTestToken = randomBytes(16).toString('hex');
   tunnelProbeToken = randomBytes(16).toString('hex');
+  const localBridgeToken = randomBytes(16).toString('hex');
+  publishLocalBridgeToken(localBridgeToken);
   // One path per surface, each with its own token. Distinct tokens rather than one shared
   // secret because the two connectors are configured separately in ChatGPT and may be
   // shared, revoked or re-pasted at different times; a single token would make "give me
@@ -350,6 +353,7 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
     const pathOnly = url.split('?')[0] ?? '';
     const selfTest = req.headers[SELF_TEST_HEADER] === selfTestToken;
     const tunnelProbe = req.headers[TUNNEL_PROBE_HEADER] === tunnelProbeToken;
+    const localBridge = req.headers['x-local-mcp-bridge'] === localBridgeToken;
 
     // Logged for every request, so the Activity tab shows what actually arrived and
     // what it was answered with. The path is reduced to a shape — it carries the
@@ -369,7 +373,7 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
           ? `oauth-metadata/${prmRoute.id}`
           : pathOnly.slice(0, 40);
       const method = req.method ?? '?';
-      const who = selfTest ? ' (self-test)' : tunnelProbe ? ' (tunnel probe)' : '';
+      const who = selfTest ? ' (self-test)' : tunnelProbe ? ' (tunnel probe)' : localBridge ? ' (local browser bridge)' : '';
       const line = `${method} ${shape} → ${res.statusCode} in ${Date.now() - startedAt}ms${who}${formatInboundTiming(timing)}`;
       // Streamable HTTP makes the server-opened SSE stream and session deletion
       // optional, and 405 is the prescribed answer for a server that offers
@@ -408,7 +412,7 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
     // Count only a validated request to the actual MCP endpoint. OAuth metadata,
     // 404s, our own self-test and tunnel-client's startup initialize probe are not
     // evidence that ChatGPT itself reached the connector.
-    if (!selfTest && !tunnelProbe) {
+    if (!selfTest && !tunnelProbe && !localBridge) {
       requestSeenAt = Date.now();
       surfaceRequestAt.set(route.id, requestSeenAt);
       noteConnectorUse(route.id, 'request', requestSeenAt);
@@ -443,7 +447,7 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
       };
       res.once('finish', release);
       res.once('close', release);
-      withInboundRequestId(requestId, () => void route.handler(req, res, body), timing, publication);
+      withInboundRequestId(requestId, () => void route.handler(req, res, body), timing, publication, localBridge);
     };
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       void readBoundedJsonBody(req).then((parsed) => {
@@ -502,6 +506,7 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
     stop: (options = {}) => {
       if (!stopping) {
         // Publish the admission fence before closing any sockets or receiving late bodies.
+        publishLocalBridgeToken(null);
         let resolveStop!: () => void;
         stopping = new Promise<void>((resolve) => { resolveStop = resolve; });
         const accepted = [...sockets.values()].reduce((count, responses) => count + responses.size, 0);

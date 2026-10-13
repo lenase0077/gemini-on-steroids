@@ -27,6 +27,7 @@ import { effectiveCapabilities, defaultConfig, getConfig } from '../src/main/con
 import { EXEC_COMMAND_CMD_DESCRIPTION, LAUNCHES_WINDOWS_POWERSHELL_5, WINDOWS_SHELL_GUIDANCE } from '../src/main/codex/tool-specs.js';
 import { skillCatalogInstructions } from '../src/main/skills.js';
 import { lastRequestAt, selfTestHeaders, startMcpServer, tunnelProbeHeaders, type McpEndpoint } from '../src/main/mcp/server.js';
+import { localBridgeHeaders } from '../src/main/mcp/bridge-endpoint.js';
 import { lastToolCallAt, type ToolContext } from '../src/main/mcp/tools.js';
 import { friendlyError } from '../src/main/mcp/kernel.js';
 import { serverInstructions } from '../src/main/mcp/instructions.js';
@@ -488,6 +489,30 @@ describe('endpoint hardening', () => {
       'x-local-self-test': 'guessed'
     });
     expect(lastRequestAt()).not.toBeNull();
+  });
+
+  it('keeps authenticated Gemini bridge tools/list and tools/call separate from native connector proof', async () => {
+    expect(lastRequestAt()).toBeNull();
+    expect(lastRequestAt('core')).toBeNull();
+    expect(lastToolCallAt('core')).toBeNull();
+
+    const headers = { ...localBridgeHeaders(), 'x-request-id': `cosmcp_${'a'.repeat(64)}` };
+    const listed = await rawPost(endpoint.urls.core, JSON.stringify({
+      jsonrpc: '2.0', id: 'local-list', method: 'tools/list', params: {}
+    }), headers);
+    expect(listed.status).toBe(200);
+    expect(lastRequestAt()).toBeNull();
+    expect(lastRequestAt('core')).toBeNull();
+
+    ctx.caps = withCaps({ read: true });
+    const called = await rawPost(endpoint.urls.core, JSON.stringify({
+      jsonrpc: '2.0', id: 'local-call', method: 'tools/call', params: {
+        name: 'read', arguments: { paths: ['/workspace/src/app.ts'] }
+      }
+    }), headers);
+    expect(called.status).toBe(200);
+    expect(lastRequestAt()).toBeNull();
+    expect(lastToolCallAt('core')).toBeNull();
   });
 
   it('does not count tunnel-client discovery/startup probes as ChatGPT traffic', async () => {

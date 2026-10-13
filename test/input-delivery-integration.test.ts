@@ -1025,7 +1025,7 @@ it.each(['gpt-6-pro', 'gpt-5.6-sol'])('carries settled Thinking failed through H
   const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
   try {
     await refreshFailedView(conversationId, ms => { now += ms; });
-    expect(await input.pendingBrowserInputs()).toEqual([{ id: first.id, conversationId, silenceTurnId: 'native-failed-turn' }]);
+    expect(await input.pendingBrowserInputs()).toEqual([{ id: first.id, conversationId, provider: 'chatgpt', silenceTurnId: 'native-failed-turn' }]);
     {
       const busyAt = Date.now();
       clock.mockReturnValue(busyAt);

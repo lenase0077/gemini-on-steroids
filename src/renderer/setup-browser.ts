@@ -44,7 +44,7 @@ export function signInState(state: AppState, where: ChatBrowser, live: boolean,
 export function initBrowserSetup(actions: {
   choose(browser: ChatBrowser): void;
   repaint(): void;
-  open(browser: ExternalBrowser, page: 'extensions' | 'chatgpt'): Promise<unknown>;
+  open(browser: ExternalBrowser, page: 'extensions' | 'chatgpt' | 'gemini'): Promise<unknown>;
 }): { render(state: AppState): { ready: boolean; choosingLocation: boolean } } {
   let current: AppState | null = null;
   let phase: 'extension' | 'location' = 'extension';
@@ -66,7 +66,7 @@ export function initBrowserSetup(actions: {
    * labels for Developer mode and Load unpacked, and where they are on its page. Repainted on a
    * language change through ui(), like every other text.
    */
-  const paintInstallSteps = (label: string): void => {
+  const paintInstallSteps = (label: string, geminiSelected: boolean): void => {
     ui($('extensionStepOpen'), 'textContent', () => t('Open the extensions page in {0}', [label]));
     ui($('extensionStepOpenHint'), 'textContent', () => Date.now() - copiedAt < 60_000
       ? t('Copied. Paste it into the address bar in {0} and press Enter.', [label])
@@ -82,7 +82,8 @@ export function initBrowserSetup(actions: {
       const picture = extensionPicture(external, 'load');
       return t('Click {0} and choose the extension folder', [quoted(picture?.label ?? t('Load unpacked'))]);
     });
-    ui($('extensionStepChatGpt'), 'textContent', () => t('Open ChatGPT in {0}', [label]));
+    ui($('extensionStepChatGpt'), 'textContent', () => t(geminiSelected ? 'Open Gemini in {0}' : 'Open ChatGPT in {0}', [label]));
+    ui($('openProviderBrowserLabel'), 'textContent', () => t(geminiSelected ? 'Open Gemini' : 'Open ChatGPT'));
     const paintPictures = (): void => {
       const dev = extensionPicture(external, 'dev');
       const load = extensionPicture(external, 'load');
@@ -102,6 +103,7 @@ export function initBrowserSetup(actions: {
       initialized = true;
       savedBrowser = browser;
     }
+    const geminiSelected = state.config.ui.newChatProvider === 'gemini';
     // Installed: the extension in the person's own browser, in a version this app expects. A live
     // sighting wins; with that browser closed, the lasting proof stands in, because the built-in
     // browser does not need Chrome open once signed in. A live old version always asks to update.
@@ -111,7 +113,12 @@ export function initBrowserSetup(actions: {
     const shownVersion = live ? observation!.version : proof?.version ?? null;
     const knownVersion = !!shownVersion && /^\d+\.\d+\.\d+$/.test(shownVersion);
     const outdated = knownVersion && isNewer(state.update.current, shownVersion!);
-    ready = state.bridge.running && state.bridge.paired && (live || proof !== null) && knownVersion && !outdated;
+    const extensionReady = state.bridge.running && state.bridge.paired && (live || proof !== null) && knownVersion && !outdated;
+    const localReady = state.status.localMcpReady === true;
+    // Pairing is a browser step; local MCP readiness is a separate connection step. Keeping
+    // those independent lets Setup reach folder/access configuration before the local endpoint
+    // can be started on installs whose filesystem capabilities still need an approved root.
+    ready = extensionReady;
     if (!steered) phase = ready ? 'location' : 'extension';
     const cos = browser === 'cos';
     $('browserExtensionStage').hidden = phase !== 'extension';
@@ -138,9 +145,11 @@ export function initBrowserSetup(actions: {
     const address = `${external}://extensions`;
     $('setupExtensionAddress').textContent = address;
     const label = external === 'edge' ? 'Edge' : external === 'brave' ? 'Brave' : 'Chrome';
-    paintInstallSteps(label);
+    paintInstallSteps(label, geminiSelected);
     ui($('setupExternalLabel'), 'textContent', () => t('Use {0} and your existing profile.', [label]));
-    ui($('extensionStatus'), 'textContent', () => ready ? (live ? t('Extension connected and up to date') : t('Extension installed and up to date'))
+    ui($('extensionStatus'), 'textContent', () => geminiSelected && extensionReady && !localReady
+      ? t('Extension ready; local MCP bridge starts after folder setup')
+      : ready ? (live ? t('Extension connected and up to date') : t('Extension installed and up to date'))
       : outdated ? t('Update your extension')
       : live && !knownVersion ? t('Extension version could not be verified')
       : t('Waiting for the browser extension'));
@@ -148,21 +157,27 @@ export function initBrowserSetup(actions: {
     ui($('extensionSetupDetail'), 'textContent', () => ready ? ''
       : !state.secureStorage?.available && state.secureStorage ? t('Secure credential storage is unavailable, so the extension cannot pair safely.')
       : !state.bridge.running ? t('Browser bridge could not start: {0}', [state.bridge.error ?? t('Not connected yet')])
+      : geminiSelected && extensionReady && !localReady ? t('The local MCP bridge starts in the connection step. Gemini does not require a remote tunnel or a native ChatGPT plugin.')
       : outdated || (live && !knownVersion) ? t('Load the extension from this app’s folder, then reload it in your browser.')
       : '');
     $('extensionSetupDetail').hidden = !$('extensionSetupDetail').textContent;
-    const login = signInState(state, browser === 'cos' ? 'cos' : external, live, proof);
+    const login = geminiSelected
+      ? { done: localReady, signedIn: false, text: () => localReady
+        ? t('Local MCP bridge ready. Google sign-in is managed by Gemini.')
+        : t('Gemini sign-in is managed by Google; the local MCP bridge is not ready yet.') }
+      : signInState(state, browser === 'cos' ? 'cos' : external, live, proof);
     const statusNode = $(cos ? 'cosBrowserState' : 'externalBrowserState');
     ui(statusNode, 'textContent', () => login.text());
     statusNode.dataset.tone = login.done ? 'ok' : 'wait';
     // Surely signed in, the same button becomes the way out. An unknown answer keeps "Sign in",
     // which also checks.
     const button = $(cos ? 'showCosBrowser' : 'openSelectedChatGpt');
+    button.hidden = geminiSelected;
     button.dataset.signedIn = String(login.signedIn);
     button.querySelector('i')!.className = login.signedIn ? 'ico ph ph-sign-out' : 'ico ph ph-sign-in';
     ui(button.querySelector('span')!, 'textContent', () => login.signedIn ? t('Sign out of ChatGPT') : t('Sign in to ChatGPT'));
     // Done is a fact about the person's setup, not about which part of the step is on screen.
-    return { ready: ready && login.done, choosingLocation: phase === 'location' };
+    return { ready: ready && (geminiSelected || login.done), choosingLocation: phase === 'location' };
   };
   const changePhase = (next: typeof phase): void => {
     if (next === 'location' && !ready) return;
@@ -200,7 +215,9 @@ export function initBrowserSetup(actions: {
     copiedAt = Date.now();
     if (current) render(current);
   })());
-  $('openChatGptBrowser').addEventListener('click', () => { void actions.open(external, 'chatgpt'); });
+  $('openChatGptBrowser').addEventListener('click', () => {
+    void actions.open(external, current?.config.ui.newChatProvider === 'gemini' ? 'gemini' : 'chatgpt');
+  });
   $('openSelectedChatGpt').addEventListener('click', event => void run(
     (event.currentTarget as HTMLElement).dataset.signedIn === 'true' ? window.api.signOutChatGpt() : window.api.openChatGpt()));
   return { render };

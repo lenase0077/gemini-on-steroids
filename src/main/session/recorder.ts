@@ -14,6 +14,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { normalizeChatProvider, type ChatProvider } from '../../shared/chat-provider.js';
 import sharp from 'sharp';
 import { userTitle } from './title.js';
 import type {
@@ -203,9 +204,10 @@ export function recordingEnabled(): boolean {
  */
 export async function sessionForConversation(
   conversationId: string | null,
-  title?: string
+  title?: string,
+  provider: ChatProvider = 'chatgpt'
 ): Promise<string | null> {
-  if (!conversationId) return initializeSessionForConversation(conversationId, title);
+  if (!conversationId) return initializeSessionForConversation(conversationId, title, provider);
 
   const pending = sessionInitializations.get(conversationId);
   if (pending) {
@@ -220,7 +222,7 @@ export async function sessionForConversation(
     return sessionId;
   }
 
-  const initializing = initializeSessionForConversation(conversationId, title);
+  const initializing = initializeSessionForConversation(conversationId, title, provider);
   sessionInitializations.set(conversationId, initializing);
   try {
     const sessionId = await initializing;
@@ -279,7 +281,8 @@ async function settleResumeCommit(): Promise<void> {
 
 async function initializeSessionForConversation(
   conversationId: string | null,
-  title?: string
+  title?: string,
+  provider: ChatProvider = 'chatgpt'
 ): Promise<string | null> {
   if (!recordingEnabled()) return null;
   if (!conversationId) return ensureUnattributedSession();
@@ -327,6 +330,7 @@ async function initializeSessionForConversation(
       conversationId,
       title: origin && origin.kind !== 'desktop' ? await titleForOrigin(origin) : title,
       origin,
+      provider: normalizeChatProvider(provider),
       titleSource: 'fallback'
     }));
   if (origin && !known) pendingOrigins.delete(conversationId);
@@ -1986,11 +1990,12 @@ function observationTitle(observations: readonly ChatObservation[]): string | un
  * streamed text, HTML or image writes. Session initialization already has its own owner. */
 export async function recordRequestEvidence(
   conversationId: string,
-  observations: readonly ChatObservation[]
+  observations: readonly ChatObservation[],
+  provider: ChatProvider = 'chatgpt'
 ): Promise<string | null> {
   if (!recordingEnabled()) return null;
   const lineage = !conversations.has(conversationId) ? await supersededLineage(conversationId) : null;
-  const sessionId = lineage ?? await sessionForConversation(conversationId, observationTitle(observations));
+  const sessionId = lineage ?? await sessionForConversation(conversationId, observationTitle(observations), provider);
   if (!sessionId) return null;
   // Proof identifies even a retired caller; kernel/recorder attachment checks then refuse it
   // as superseded. Never turn an exact historical owner into anonymous executable authority.
@@ -2007,7 +2012,8 @@ export async function recordRequestEvidence(
 export function recordChatObservations(
   conversationId: string,
   observations: readonly ChatObservation[],
-  agent?: string | null
+  agent?: string | null,
+  provider: ChatProvider = 'chatgpt'
 ): Promise<{
   sessionId: string | null;
   stored: number;
@@ -2015,14 +2021,14 @@ export function recordChatObservations(
   goalCandidates: Array<{ replyId: string; turnId: string; eventSeq: number }>;
 }> {
   const hasEvidence = observations.some((item) => item.kind === 'tool_evidence');
-  const ownership = hasEvidence ? recordRequestEvidence(conversationId, observations) : null;
+  const ownership = hasEvidence ? recordRequestEvidence(conversationId, observations, provider) : null;
   // Observe rejection now even if an earlier transcript batch is still blocked. The queued
   // work below rethrows it to the journal owner, which retains the batch for its normal retry.
   void ownership?.catch(() => undefined);
   const transcript = hasEvidence ? observations.filter((item) => item.kind !== 'tool_evidence') : observations;
   return serializeObservations(conversationId, async () => {
     await ownership;
-    return recordChatObservationsNow(conversationId, transcript, agent);
+    return recordChatObservationsNow(conversationId, transcript, agent, provider);
   });
 }
 
@@ -2124,7 +2130,8 @@ async function recordSupersededMessages(
 async function recordChatObservationsNow(
   conversationId: string,
   observations: readonly ChatObservation[],
-  agent?: string | null
+  agent?: string | null,
+  provider: ChatProvider = 'chatgpt'
 ): Promise<{
   sessionId: string | null;
   stored: number;
@@ -2159,7 +2166,8 @@ async function recordChatObservationsNow(
   }
   const sessionId = await sessionForConversation(
     conversationId,
-    pageTitle?.text?.trim() || observedUserTitle(firstUser?.text)
+    pageTitle?.text?.trim() || observedUserTitle(firstUser?.text),
+    provider
   );
   if (!sessionId) return { sessionId: null, stored: 0, activity, goalCandidates: [] };
   const live = conversations.get(conversationId);

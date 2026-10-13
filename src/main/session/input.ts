@@ -6,6 +6,7 @@ import { REASONING_EFFORTS, workSequence } from '../../shared/session.js';
 import { z } from 'zod';
 import { browserInputModel, manualInput, queuedFollowup, MAX_INPUT_IMAGES, type InputImage } from '../../shared/input.js';
 import type { SessionSummary } from '../../shared/session.js';
+import { CHAT_PROVIDERS, normalizeChatProvider, type ChatProvider } from '../../shared/chat-provider.js';
 import { getConfig } from '../config.js';
 import { randomUUID } from 'node:crypto';
 import { userTitle } from './title.js';
@@ -50,7 +51,10 @@ export const inputArgs = z.object({
   afterTurn: z.boolean().optional(),
   dueAt: z.number().int().nonnegative(),
   model: z.string().max(80).nullable(),
-  reasoningEffort: z.enum(REASONING_EFFORTS).nullable()
+  reasoningEffort: z.enum(REASONING_EFFORTS).nullable(),
+  /** Provider inheritance source for an app-owned Goal/Loop decision chat. */
+  decisionSourceSessionId: z.string().min(8).max(64).optional(),
+  provider: z.enum(CHAT_PROVIDERS).optional()
 });
 export type InputArgs = z.infer<typeof inputArgs>;
 const entrySchema = inputArgs.extend({
@@ -83,7 +87,6 @@ const entrySchema = inputArgs.extend({
   companionInputId: z.string().uuid().optional(),
   purpose: z.enum(['user', 'decision']).optional(),
   lifetime: z.literal('temporary-planner').optional(),
-  decisionSourceSessionId: z.string().min(8).max(64).optional(),
   response: z.string().max(16000).optional(),
   state: z.enum(['queued', 'browser', 'tool', 'sent', 'cancelled', 'failed', 'decision']),
   offeredAt: z.number().optional(),
@@ -709,6 +712,7 @@ async function materializeOpening(entry: InputEntry): Promise<void> {
     existing.origin?.kind !== 'worker' && existing.origin?.kind !== 'helper';
   const session = recoveredExactOwner ? existing : await createSession({ reservedId: entry.sessionId,
     title: userTitle(entry.text, entry.text), titleSource: 'fallback',
+    provider: normalizeChatProvider(entry.provider),
     origin: { kind: 'desktop', fromSessionId: null, agentId: null, task: '' } });
   if (session.conversationId && session.conversationId !== entry.conversationId)
     throw new Error('Reserved opening session belongs to another ChatGPT conversation');
@@ -722,11 +726,18 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
     const current = await load();
     const prior = current.find((entry) => entry.id === input.id);
     if (prior) {
+      // Provider is part of the accepted outbox identity. Retrying an older caller that
+      // omitted it must retain the already-frozen choice rather than re-read Settings.
+      if (input.provider === undefined && prior.provider !== undefined) input.provider = prior.provider;
       if (JSON.stringify(inputArgs.parse({ ...prior, sessionId: prior.opening ? prior.requestedSessionId ?? null : prior.sessionId, mode: prior.requestedMode ?? prior.mode })) !== JSON.stringify(input)) throw new Error('Message id already belongs to different input');
       if (!terminal(prior)) await materializeOpening(prior);
       return { ...prior };
     }
     const requestedSession = input.sessionId ? await getSession(input.sessionId) : null;
+    const decisionSource = input.decisionSourceSessionId ? await getSession(input.decisionSourceSessionId) : null;
+    const inheritedProvider = requestedSession?.provider ?? decisionSource?.provider;
+    if (input.provider && inheritedProvider && input.provider !== inheritedProvider) throw new Error('Input provider does not match its owning session');
+    input.provider = normalizeChatProvider(inheritedProvider ?? input.provider ?? getConfig().ui.newChatProvider);
     // Explicit injection has its own recipient and can never spend a browser completion.
     const activity = requestedSession && input.delivery !== 'tool' && input.attachmentDelivery !== 'tool'
       ? deliveryHooks?.activity?.(requestedSession) : null;
@@ -1469,9 +1480,9 @@ async function completedStageBoundary(entry: InputEntry, current: InputEntry[]):
       row.dueAt <= Date.now() && ['queued', 'browser', 'tool'].includes(row.state))) return null;
   return turnId;
 }
-export function pendingBrowserInputs(): Promise<Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner'; project?: string }>> {
+export function pendingBrowserInputs(): Promise<Array<{ id: string; conversationId: string | null; provider: ChatProvider; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner'; project?: string }>> {
   return serial(async () => {
-    const result: Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner'; project?: string }> = [];
+    const result: Array<{ id: string; conversationId: string | null; provider: ChatProvider; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner'; project?: string }> = [];
     const current = await load();
     for (const entry of ordered(current)) {
       if (companionOf(current, entry)) continue;
@@ -1489,7 +1500,7 @@ export function pendingBrowserInputs(): Promise<Array<{ id: string; conversation
           ? await readRecentEvents(entry.sessionId, 1, { kinds: ['turn_start', 'turn_end'] }) : [];
         const silenceTurnId = entry.silenceBoundary?.turnId ?? (end?.kind === 'turn_end' && end.outcome === 'failed' &&
           end.reason === 'thinking_failed' && end.turnId && await eligibleStageEnd(entry) === end.turnId ? end.turnId : undefined);
-        result.push({ id: entry.id, conversationId,
+        result.push({ id: entry.id, conversationId, provider: normalizeChatProvider(entry.provider),
           ...(entry.recovery ? { recovery: { questionId: entry.recovery.questionId, stop: entry.silenceBoundary?.nativeBusy === true && entry.recovery.phase === 'ready' } } : {}),
           ...(silenceTurnId ? { silenceTurnId } : {}),
           ...(entry.directTurn ? { directTurn: entry.directTurn } : {}),
@@ -1999,6 +2010,7 @@ export async function requestBrowserDecision(text: string, signal: AbortSignal, 
         // null means ChatGPT's current selection; only an omitted value gets the historical default.
         model: options.model === undefined ? DEFAULT_HELPER_CHAT_MODEL : options.model,
         reasoningEffort: options.reasoningEffort === undefined ? 'high' : options.reasoningEffort,
+        provider: normalizeChatProvider(options.sourceSessionId ? (await getSession(options.sourceSessionId))?.provider : undefined),
         decisionSourceSessionId: options.sourceSessionId, lifetime: options.lifetime, purpose: 'decision', state: 'queued', owner: null,
         createdAt: Date.now(), conversationId: options.conversationId ?? null });
       await commit(append(current, entry));

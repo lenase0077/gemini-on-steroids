@@ -137,6 +137,8 @@ export interface UiPrefs {
   defaultChatModel?: string;
   /** Preferred reasoning for a fresh ordinary chat; omitted keeps the model's normal fallback. */
   defaultChatReasoning?: ReasoningEffort;
+  /** Explicit native frontend for newly accepted sessions; existing sessions keep their stored provider. */
+  newChatProvider?: import('./chat-provider.js').ChatProvider;
   /** Maintenance may reuse existing tabs but cannot open helpers or missing chats. */
   browserOnly?: boolean;
   backgroundChats?: boolean;
@@ -433,6 +435,8 @@ export interface TunnelHealth {
 
 export interface ConnectionStatus {
   state: ConnectionState;
+  /** Local MCP listener readiness, independent from a remote ChatGPT tunnel or native connector proof. */
+  localMcpReady?: boolean;
   /** Short human-readable explanation, safe to display. Never contains secrets. */
   detail: string;
   /** Public URL to paste into ChatGPT, for the cloudflared/manual paths only. */

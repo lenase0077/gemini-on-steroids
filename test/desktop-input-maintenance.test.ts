@@ -250,7 +250,7 @@ it('carries the direct-turn offer only to the elected existing conversation', as
 });
 
 type Tab = { id: number; url?: string; pendingUrl?: string; windowId?: number; active?: boolean; pinned?: boolean };
-async function worker(inputs: Array<{ id: string; conversationId: string | null; directTurn?: { id: string; startedAt: number }; supersededConversationId?: string; project?: string }>, modelCatalogRequest?: { nonce: string; expiresAt: number }, priorLocal: Record<string, unknown> = {}, priorSession: Record<string, unknown> = {}, rendered?: Set<number>) {
+async function worker(inputs: Array<{ id: string; conversationId: string | null; provider?: 'chatgpt' | 'gemini'; directTurn?: { id: string; startedAt: number }; supersededConversationId?: string; project?: string }>, modelCatalogRequest?: { nonce: string; expiresAt: number }, priorLocal: Record<string, unknown> = {}, priorSession: Record<string, unknown> = {}, rendered?: Set<number>) {
   const tabs: Tab[] = [];
   const event = { addListener: () => {} };
   const tabUpdated = { addListener: vi.fn() };
@@ -308,16 +308,60 @@ async function worker(inputs: Array<{ id: string; conversationId: string | null;
     fetch, URL, URLSearchParams, AbortController, setTimeout, clearTimeout, TextEncoder, console
   });
   vm.runInContext(activeTabsSource, context);
-  vm.runInContext(`${source}\nglobalThis.testMaintenance = { load, maintain, releaseTab, serializeTab, noteTabConversation, createChatTab, authorizeDocument, ackDesktopInput, drainCommandAcks, inspectRequestedModels, desktopInput: HANDLERS.desktop_input, catalog: HANDLERS.model_catalog, events: HANDLERS.events, bind: HANDLERS.bind, closed: HANDLERS.closed, loadFailure: HANDLERS.load_failure, correlate: HANDLERS.correlate, applyRequestedBrowserPreferences };`, context);
+  vm.runInContext(`${source}\nglobalThis.testMaintenance = { load, maintain, releaseTab, serializeTab, noteTabConversation, createChatTab, deliverDesktopInputs, placeSuccessorChat, authorizeDocument, ackDesktopInput, drainCommandAcks, inspectRequestedModels, desktopInput: HANDLERS.desktop_input, catalog: HANDLERS.model_catalog, events: HANDLERS.events, bind: HANDLERS.bind, closed: HANDLERS.closed, loadFailure: HANDLERS.load_failure, correlate: HANDLERS.correlate, applyRequestedBrowserPreferences };`, context);
   const api = context.testMaintenance as { releaseTab(...args: any[]): Promise<any>; serializeTab(tab: number, operation: () => Promise<any>): Promise<any>; noteTabConversation(source: any, conversationId: string): Promise<any>; applyRequestedBrowserPreferences(request: object): Promise<void>; authorizeDocument(sender: unknown, message: unknown): Promise<any>; catalog(message: unknown, sender: unknown, source: unknown): Promise<any>; load(): Promise<void>; maintain(): Promise<void>; createChatTab(url: string, background: boolean): Promise<Tab> };
   await api.load();
   Object.assign(api, { query });
   const updated = (id: number, change: object) => tabUpdated.addListener.mock.calls[0]![0](id, change, tabs.find(tab => tab.id === id));
   vm.runInContext('Object.assign(testMaintenance, { offerStopTurns, noteTabConversation, ackCommand })', context);
-  return { ...api, scripting, updated, update, inspectModels: (context.testMaintenance as any).inspectRequestedModels as (request: unknown, background: boolean) => Promise<void>, ackDesktopInput: (context.testMaintenance as any).ackDesktopInput as (...args: string[]) => Promise<any>, drainCommandAcks: (context.testMaintenance as any).drainCommandAcks as () => Promise<any>, desktopInput: (context.testMaintenance as any).desktopInput as (...args: any[]) => Promise<any>, events: (context.testMaintenance as any).events as (message: any, sender: any, source: any) => Promise<any>, bind: (context.testMaintenance as any).bind as (message: any, sender: any, source: any) => Promise<any>, correlate: (context.testMaintenance as any).correlate as (message: any, sender: any, source: any) => Promise<any>, closed: (context.testMaintenance as any).closed as (message: any, sender: any, source: any) => Promise<any>, loadFailure: (context.testMaintenance as any).loadFailure as (message: any, sender: any, source: any) => Promise<any>, create, sendMessage, tabs, fetch, windows, remove, reload, local, localSaved, saved };
+  return { ...api, deliverInputs: (context.testMaintenance as any).deliverDesktopInputs as (...args: any[]) => Promise<void>, placeSuccessor: (context.testMaintenance as any).placeSuccessorChat as (...args: any[]) => Promise<void>, scripting, updated, update, inspectModels: (context.testMaintenance as any).inspectRequestedModels as (request: unknown, background: boolean) => Promise<void>, ackDesktopInput: (context.testMaintenance as any).ackDesktopInput as (...args: string[]) => Promise<any>, drainCommandAcks: (context.testMaintenance as any).drainCommandAcks as () => Promise<any>, desktopInput: (context.testMaintenance as any).desktopInput as (...args: any[]) => Promise<any>, events: (context.testMaintenance as any).events as (message: any, sender: any, source: any) => Promise<any>, bind: (context.testMaintenance as any).bind as (message: any, sender: any, source: any) => Promise<any>, correlate: (context.testMaintenance as any).correlate as (message: any, sender: any, source: any) => Promise<any>, closed: (context.testMaintenance as any).closed as (message: any, sender: any, source: any) => Promise<any>, loadFailure: (context.testMaintenance as any).loadFailure as (message: any, sender: any, source: any) => Promise<any>, create, sendMessage, tabs, fetch, windows, remove, reload, local, localSaved, saved };
 }
 
 describe('one browser maintenance flight per desktop outbox publication', () => {
+  it('opens Gemini /app for a Gemini input instead of reusing a ChatGPT tab with the same marker', async () => {
+    const h = await worker([]);
+    h.tabs.push({ id: 7, url: `https://chatgpt.com/?cos-input=${firstId}#cos-input=${firstId}` });
+
+    await h.deliverInputs([{ id: firstId, conversationId: null, provider: 'gemini' }], false, [], [firstId], async () => {});
+
+    expect(h.create).toHaveBeenCalledTimes(1);
+    expect(h.create).toHaveBeenCalledWith(expect.objectContaining({
+      url: `https://gemini.google.com/app?cos-input=${firstId}#cos-input=${firstId}`
+    }));
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    expect(h.localSaved.inputOpenings).toMatchObject({ [firstId]: { provider: 'gemini' } });
+  });
+
+  it('offers a Gemini conversation input only to its Gemini tab when both providers share the id', async () => {
+    const h = await worker([]);
+    h.tabs.push(
+      { id: 7, url: `https://chatgpt.com/c/${'4f8a9b2c1d3e5f60'}` },
+      { id: 8, url: `https://gemini.google.com/app/${'4f8a9b2c1d3e5f60'}` }
+    );
+
+    await h.deliverInputs([{ id: firstId, conversationId: '4f8a9b2c1d3e5f60', provider: 'gemini' }], false, [], [firstId], async () => {});
+    await Promise.resolve();
+
+    expect(h.create).not.toHaveBeenCalled();
+    expect(h.sendMessage).toHaveBeenCalledWith(8, expect.objectContaining({
+      type: 'clf-desktop-input', id: firstId, provider: 'gemini', conversationId: '4f8a9b2c1d3e5f60'
+    }));
+    expect(h.sendMessage).not.toHaveBeenCalledWith(7, expect.anything());
+  });
+
+  it('opens an extension-owned Gemini successor beside its source in Gemini', async () => {
+    const h = await worker([]);
+    const home = { id: 9, url: 'https://gemini.google.com/app/4f8a9b2c1d3e5f60', windowId: 3, index: 4 };
+    h.tabs.push(home);
+
+    await h.placeSuccessor({ id: firstId, provider: 'gemini', homeConversationId: '4f8a9b2c1d3e5f60', active: true }, home.id);
+
+    expect(h.create).toHaveBeenCalledWith(expect.objectContaining({
+      url: `https://gemini.google.com/app?clf=${firstId}#clf=${firstId}`,
+      windowId: 3, active: true, index: 5
+    }));
+  });
+
   it.each(['same', 'missing', 'wrong-document', 'wrong-url', 'wrong-frame', 'replaced-during-proof'])('uses exact Chrome document proof for loading+URL events (%s)', async scenario => {
     const h = await worker([]);
     const tab = { id: 7, url: `https://chatgpt.com/c/${secondId}` };

@@ -1,6 +1,6 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 import type { InputArgs, InputEntry } from '../src/main/session/input.js';
-const ports = vi.hoisted(() => ({ backgroundChats: false, running: false as boolean | null, connect: vi.fn(), status: { state: 'connected', detail: '' },
+const ports = vi.hoisted(() => ({ backgroundChats: false, running: false as boolean | null, connect: vi.fn(), status: { state: 'connected', detail: '', localMcpReady: false } as { state: string; detail: string; localMcpReady?: boolean },
   browser: { connected: false, present: false, lastSeenAt: null as number | null }, open: vi.fn(), bridge: vi.fn(), enqueue: vi.fn(), cancel: vi.fn(), note: vi.fn(), rows: [] as InputEntry[], listeners: new Set<() => void>() }));
 vi.mock('../src/main/connection.js', () => ({ connect: ports.connect, getStatus: () => ports.status, onStatusChange: (fn: () => void) => { ports.listeners.add(fn); return () => ports.listeners.delete(fn); } }));
 vi.mock('../src/main/bridge.js', () => ({ bridgeStatus: async () => ports.browser, browserWakeConnected: () => ports.browser.connected, startBridge: ports.bridge }));
@@ -12,7 +12,7 @@ const request: InputArgs = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', session
 beforeEach(() => {
   vi.resetAllMocks(); resetInputStartupForTests();
   ports.rows = []; ports.listeners.clear(); ports.backgroundChats = false; ports.running = false;
-  ports.status = { state: 'connected', detail: '' }; ports.browser = { connected: false, present: false, lastSeenAt: null };
+  ports.status = { state: 'connected', detail: '', localMcpReady: false }; ports.browser = { connected: false, present: false, lastSeenAt: null };
   ports.bridge.mockResolvedValue(8765); ports.open.mockResolvedValue('chrome.exe');
   ports.enqueue.mockImplementation(async (input: InputArgs): Promise<InputEntry> => {
     const row: InputEntry = { ...input, ...(input.delivery === 'tool' ? { transportIntent: 'tool' as const } : {}),
@@ -31,6 +31,23 @@ it('accepts input before readiness, but waits for the connector before opening t
   for (const listener of ports.listeners) listener();
   await pending;
   expect(ports.enqueue).toHaveBeenCalledTimes(1); expect(ports.listeners.size).toBe(0);
+});
+it('uses local MCP readiness and a Gemini URL for an accepted Gemini opening input', async () => {
+  ports.status = { state: 'disconnected', detail: 'Local MCP bridge ready', localMcpReady: true };
+  await sendDesktopInput({ ...request, provider: 'gemini' });
+  await vi.waitFor(() => expect(ports.open).toHaveBeenCalledTimes(1));
+  expect(ports.connect).toHaveBeenCalledWith('gemini');
+  const url = new URL(ports.open.mock.calls[0]![0]);
+  expect(url.origin).toBe('https://gemini.google.com');
+  expect(url.pathname).toBe('/app');
+  expect(url.searchParams.get('cos-input')).toBe(request.id);
+});
+it('does not treat a connected remote tunnel as Gemini local MCP readiness', async () => {
+  ports.status = { state: 'connected', detail: 'Remote tunnel ready', localMcpReady: false };
+  await sendDesktopInput({ ...request, provider: 'gemini' });
+  await vi.waitFor(() => expect(ports.rows[0]?.error).toContain('Remote tunnel ready'));
+  expect(ports.connect).toHaveBeenCalledWith('gemini');
+  expect(ports.open).not.toHaveBeenCalled();
 });
 it('leaves explicit tool delivery on the durable queue without browser startup', async () => {
   const row = await sendDesktopInput({ ...request, sessionId: 'session-existing', delivery: 'tool' });

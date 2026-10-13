@@ -5,9 +5,11 @@ import { describe, expect, it, vi } from 'vitest';
 const source = (await fs.readFile('extension/active-tabs.js', 'utf8')).replace('export function', 'function');
 const A = { id: 1, url: 'https://chatgpt.com/c/a' };
 const B = { id: 2, url: 'https://chatgpt.com/c/b' };
+const GEMINI = { id: 3, url: 'https://gemini.google.com/app/4f8a9b2c1d3e5f60' };
+const GEMINI_NEW = { id: 4, url: 'https://gemini.google.com/app' };
 function setup(stored: unknown[] = []) {
   const data: Record<string, unknown> = { cosActiveTabs: stored };
-  const tabs = new Map([[1, A], [2, B]]), attached = new Set<number>();
+  const tabs = new Map([[1, A], [2, B], [3, GEMINI], [4, GEMINI_NEW]]), attached = new Set<number>();
   const chrome = {
     storage: { session: {
       get: vi.fn(async (key: string) => ({ [key]: data[key] })),
@@ -24,11 +26,24 @@ function setup(stored: unknown[] = []) {
       sendCommand: vi.fn(async () => ({}))
     }
   };
-  const make = () => vm.runInNewContext(`${source}; createActiveTabs(chrome)`, { chrome });
+  const make = () => vm.runInNewContext(`${source}; createActiveTabs(chrome)`, { chrome, URL });
   return { chrome, data, tabs, attached, make, control: make() };
 }
 
-describe('active ChatGPT rendering leases', () => {
+describe('provider rendering leases', () => {
+  it('accepts Gemini app routes but rejects other Gemini pages and malformed conversation routes', async () => {
+    const { control, chrome, attached } = setup();
+    await control.set('policy', [GEMINI, GEMINI_NEW]);
+    expect([...attached]).toEqual([3, 4]);
+    expect(chrome.debugger.attach).toHaveBeenCalledTimes(2);
+    await control.set('policy', [
+      { id: 4, url: 'https://gemini.google.com/settings' },
+      { id: 5, url: 'https://gemini.google.com/app/not-a-16-hex-id' }
+    ]);
+    expect([...attached]).toEqual([]);
+    expect(chrome.debugger.attach).toHaveBeenCalledTimes(2);
+  });
+
   it('protects only requested active pages, releases idle pages, and never changes browser focus', async () => {
     const { control, chrome, attached } = setup();
     await control.set('policy', [A]);

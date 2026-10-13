@@ -582,7 +582,7 @@
                           <figure class="ext-figure" id="extensionPictureDev"></figure></div></li>
                         <li><div><b id="extensionStepLoad">Click Load unpacked and choose the extension folder</b><button class="btn btn-solid setup-tunnel-open" id="bridgeFolder" type="button"><i class="ico ph ph-folder" aria-hidden="true"></i><span>Open extension folder</span></button>
                           <figure class="ext-figure" id="extensionPictureLoad"></figure></div></li>
-                        <li><div><b id="extensionStepChatGpt">Open ChatGPT in your browser</b><button class="btn btn-quiet" id="openChatGptBrowser" type="button"><span>Open ChatGPT</span><i class="ico ph ph-arrow-square-out" aria-hidden="true"></i></button></div></li>
+                        <li><div><b id="extensionStepChatGpt">Open ChatGPT in your browser</b><button class="btn btn-quiet" id="openChatGptBrowser" type="button"><span id="openProviderBrowserLabel">Open ChatGPT</span><i class="ico ph ph-arrow-square-out" aria-hidden="true"></i></button></div></li>
                       </ol>
                       <details class="extension-help"><summary><svg class="disclosure-chevron details-chevron" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.5 10.5 8 6 12.5"></path></svg>Need help?</summary><div class="extension-meta"><p class="extension-folder" id="extensionPath"></p><button class="btn btn-quiet" id="bridgeDownload" type="button">Download extension ZIP</button><p id="bridgeState" class="muted"></p></div></details>
                     </div>
@@ -743,8 +743,8 @@
                   <i class="ico tick ph ph-check" aria-hidden="true"></i>
                 </div>
                 <div class="step-body">
-                  <h3>Connect the tunnel</h3>
-                  <p class="step-lead">Click Connect and wait for Connected.</p>
+                  <h3 id="connectStepTitle">Connect the tunnel</h3>
+                  <p class="step-lead" id="connectStepLead">Click Connect and wait for Connected.</p>
                   <p class="status-pill" id="wizStatusPill" data-tone="off"></p>
                   <p class="hint is-warn" id="wizStatus" hidden></p>
                   <p class="hint step-quiet" id="backgroundRunningCopy">
@@ -968,6 +968,7 @@
                 <div class="settings-surface pane">
                   <div class="setting"><span class="setting-text"><b>Available ChatGPT models</b><em id="chatModelStatus">Read model choices from your account.</em></span><button class="btn" id="refreshChatModels" type="button">Refresh</button></div>
                   <div class="setting"><span class="setting-text"><b id="defaultChatModelTitle">Default new-chat model</b><em>Used when you start a new chat. A chat you continue keeps its own model.</em></span><select id="defaultChatModel" aria-labelledby="defaultChatModelTitle"><option value="">Automatic</option></select></div>
+                  <div class="setting"><span class="setting-text"><b id="newChatProviderTitle">New-chat provider</b><em>Choose the native chat surface for new sessions. Existing sessions keep their provider.</em></span><select id="newChatProvider" aria-labelledby="newChatProviderTitle"><option value="chatgpt">ChatGPT</option><option value="gemini" translate="no">Gemini</option></select></div>
                   <div class="setting"><span class="setting-text"><b id="defaultChatReasoningTitle">Default new-chat reasoning</b><em>Used with the ordinary chat model above; workers and helpers keep their own defaults.</em></span><select id="defaultChatReasoning" aria-labelledby="defaultChatReasoningTitle"><option value="">Automatic</option></select></div>
                   <div class="setting"><span class="setting-text"><b id="workerModelTitle">Default sub-agent model</b><em>Confirmed in ChatGPT before a worker starts.</em></span><select id="workerModel" aria-labelledby="workerModelTitle"><option value="" disabled>No observed choices</option></select></div>
                   <div class="setting"><span class="setting-text"><b id="workerReasoningTitle">Default sub-agent reasoning</b><em>Selected independently from the model.</em></span><select id="workerReasoning" aria-labelledby="workerReasoningTitle"><option value="" disabled>No observed choices</option></select></div>

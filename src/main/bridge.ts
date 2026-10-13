@@ -16,6 +16,8 @@ import { isDeliberateEffort, isProModel } from '../shared/chat-models.js';
 import { supportsFinishAutomation } from '../shared/finish.js';
 import { injectedUserMessage, recordedRequestTurn, responseTurnId, type TimelineTurns } from '../shared/chronology.js';
 import type { SessionSummary } from '../shared/session.js';
+import { CHAT_PROVIDERS, normalizeChatProvider } from '../shared/chat-provider.js';
+import { conversationUrl, newChatUrl, type ChatProvider } from '../shared/chat-provider.js';
 import { messageReferences } from '../shared/session.js';
 import { turnTrace } from '../shared/turn-trace.js';
 import { publishBrowserDecision, authorizeBrowserInput, sessionInputPolicy, collectRecordedBrowserDecision, type InputActivity } from './session/input.js';
@@ -48,12 +50,13 @@ import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindB
  *   · the Origin must be a chrome-extension:// origin, so a web page cannot drive it
  *   · bodies are capped and requests are rate limited
  *
- * It accepts ChatGPT observations and returns summaries/queued commands. Direct browser
- * RPCs only hand out kernel-admitted commands to the paired extension; a page cannot
- * submit an action, read a local file, run a process or change a permission here.
+ * It accepts provider observations and returns summaries/queued commands. The paired
+ * extension's MCP-over-DOM gateway is only a loopback transport into the live, surface-
+ * scoped MCP endpoint: schema validation, caller correlation and kernel permissions still
+ * decide every tool call. It does not expose a second tool executor or permission bypass.
  */
 
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
 import type { BridgeStatus, CompanionDiagnostics, CompanionPageDiagnostics, CompanionTabDiagnostics, CompanionTraceEntry } from '../shared/types.js';
 import { BROWSER_PICKUP_BACKOFF_MS, BROWSER_PICKUP_MAX_ATTEMPTS, recoveryBusyMs } from '../shared/recovery.js';
@@ -234,6 +237,8 @@ import { requestCorrelation } from './session/correlation.js';
 import { completeImageExport, IMAGE_EXPORT_BODY_BYTES, pendingImageExports } from './image-export.js';
 import { bindAgentWorkspace } from './workspace.js';
 import { extensionUpdateOffer, prepareExtensionUpdate, shippedExtensionBuild } from './extension-path.js';
+import { bridgeMcpEndpointUrl, bridgeMcpEndpointUrls, localBridgeHeaders } from './mcp/bridge-endpoint.js';
+import { SURFACE_IDS, type SurfaceId } from './mcp/surfaces.js';
 
 /** Fixed candidates so the extension can find the app without being told a port. */
 export const DEFAULT_PORTS = BROWSER_BRIDGE_AUTO_PORTS;
@@ -311,6 +316,12 @@ const COMMAND_TTL_MS = 30 * 60_000;
 const MAX_COMMANDS = 20;
 const MAX_COMMAND_RECEIPTS = 64;
 const COMMANDS_STATE = 'bridge-commands';
+const MCP_BRIDGE_CALLS_STATE = 'mcp-bridge-calls';
+const MCP_BRIDGE_MAX_CALLS = 10_000;
+const MCP_BRIDGE_MAX_RESULT_BYTES = 1024 * 1024;
+const MCP_BRIDGE_MAX_LEDGER_BYTES = 32 * 1024 * 1024;
+const MCP_BRIDGE_MAX_ARGUMENT_BYTES = 1024 * 1024;
+const MCP_BRIDGE_MAX_RESPONSE_BYTES = 1024 * 1024;
 /**
  * Durable explicit-disconnect marker stored in the bridge credential slot itself.
  *
@@ -440,7 +451,7 @@ interface Command {
    */
   claimedAt: number | null;
   /** Transient uncollected placement, owned by this command and removed on handout. */
-  placement?: { conversationId: string | null; background: boolean };
+  placement?: { conversationId: string | null; background: boolean; provider: ChatProvider };
   /**
    * The one-shot that ends this command when its deadline passes. Memory only.
    *
@@ -595,6 +606,396 @@ function bindLeasedWorkerCommand(agent: string | null, commandId: string | null,
       command.claimedAt !== null
   );
   return pending?.spec.type === 'worker' ? bindConversation(agent, conversation, pending.spec.runId) : false;
+}
+
+/** Binds a worker only from the exact server-owned command lease; request JSON has no agent authority. */
+function bindLeasedWorkerCommandId(commandId: string, conversation: string): string | null {
+  const pending = commands.find((command) =>
+    command.id === commandId && command.spec.type === 'worker' &&
+    swarmRunning(command.spec.runId) && command.claimedAt !== null);
+  if (pending?.spec.type !== 'worker') return null;
+  return bindLeasedWorkerCommand(pending.spec.agent, pending.id, conversation) ? pending.spec.agent : null;
+}
+
+interface McpBridgeCallResult {
+  status: number;
+  body: unknown;
+}
+
+interface McpBridgeCallRecord {
+  key: string;
+  fingerprint: string;
+  callId: string;
+  requestId: string;
+  state: 'admitted' | 'completed';
+  response?: McpBridgeCallResult;
+}
+
+interface McpBridgeCallLedger {
+  version: 1;
+  calls: McpBridgeCallRecord[];
+}
+
+interface McpBridgeCallInput {
+  callId: string;
+  conversationId: string;
+  surface: SurfaceId;
+  name: string;
+  args: Record<string, unknown>;
+  agentCommandId?: string;
+}
+
+const mcpBridgeCallRecords = new Map<string, McpBridgeCallRecord>();
+const mcpBridgeCallsInFlight = new Map<string, { fingerprint: string; work: Promise<McpBridgeCallResult> }>();
+let mcpBridgeLedgerLoaded: Promise<void> | null = null;
+let mcpBridgeLedgerWrite: Promise<void> = Promise.resolve();
+
+function mcpBridgeLedgerSnapshot(): McpBridgeCallLedger {
+  return { version: 1, calls: [...mcpBridgeCallRecords.values()] };
+}
+
+function validMcpBridgeCallRecord(value: unknown): value is McpBridgeCallRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  if (typeof row['key'] !== 'string' || !/^[a-f0-9]{64}$/.test(row['key']) ||
+      typeof row['fingerprint'] !== 'string' || !/^[a-f0-9]{64}$/.test(row['fingerprint']) ||
+      typeof row['callId'] !== 'string' || row['callId'].length < 1 || row['callId'].length > 200 || /[\u0000-\u0020\u007f]/.test(row['callId']) ||
+      typeof row['requestId'] !== 'string' || !/^cosmcp_[a-f0-9]{64}$/.test(row['requestId']) ||
+      (row['state'] !== 'admitted' && row['state'] !== 'completed')) return false;
+  if (row['state'] === 'completed') {
+    const response = row['response'];
+    if (!response || typeof response !== 'object' || Array.isArray(response)) return false;
+    const item = response as Record<string, unknown>;
+    if (!Number.isInteger(item['status']) || typeof item['body'] === 'undefined') return false;
+  }
+  return true;
+}
+
+async function ensureMcpBridgeLedger(): Promise<void> {
+  if (!mcpBridgeLedgerLoaded) {
+    mcpBridgeLedgerLoaded = (async () => {
+      const stored = await readDurable<McpBridgeCallLedger>(MCP_BRIDGE_CALLS_STATE, { strict: true });
+      if (stored === null) return;
+      if (!stored || stored.version !== 1 || !Array.isArray(stored.calls) ||
+          stored.calls.length > MCP_BRIDGE_MAX_CALLS || stored.calls.some((row) => !validMcpBridgeCallRecord(row))) {
+        throw new Error('Invalid MCP bridge call ledger');
+      }
+      const bytes = Buffer.byteLength(JSON.stringify(stored));
+      if (bytes > MCP_BRIDGE_MAX_LEDGER_BYTES) throw new Error('MCP bridge call ledger exceeds its limit');
+      let recoveredAdmission = false;
+      for (const row of stored.calls) {
+        if (mcpBridgeCallRecords.has(row.key)) throw new Error('Duplicate MCP bridge call ledger key');
+        // A prior process may have died after the durable admission barrier. Its tool
+        // outcome is unknowable, so persist a terminal ambiguity receipt and release the
+        // reservation; never retry the MCP dispatch merely because the caller retried.
+        if (row.state === 'admitted') {
+          row.state = 'completed';
+          row.response = { status: 409, body: { error: 'call_outcome_unknown', callId: row.callId } };
+          recoveredAdmission = true;
+        }
+        mcpBridgeCallRecords.set(row.key, row);
+      }
+      if (recoveredAdmission) await writeDurableNow(MCP_BRIDGE_CALLS_STATE, mcpBridgeLedgerSnapshot());
+    })();
+  }
+  await mcpBridgeLedgerLoaded;
+}
+
+function persistMcpBridgeLedger(): Promise<void> {
+  const write = mcpBridgeLedgerWrite.then(async () => {
+    const snapshot = mcpBridgeLedgerSnapshot();
+    const bytes = Buffer.byteLength(JSON.stringify(snapshot));
+    if (bytes > MCP_BRIDGE_MAX_LEDGER_BYTES) throw new Error('MCP bridge call ledger exceeds its limit');
+    await writeDurableNow(MCP_BRIDGE_CALLS_STATE, snapshot);
+  });
+  mcpBridgeLedgerWrite = write.catch(() => undefined);
+  return write;
+}
+
+function canonicalJson(value: unknown, depth = 0, budget = { nodes: 0 }): string {
+  if (depth > 64 || ++budget.nodes > 100_000) throw new Error('invalid_arguments');
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('invalid_arguments');
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item, depth + 1, budget)).join(',')}]`;
+  if (typeof value === 'object') {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key], depth + 1, budget)}`).join(',')}}`;
+  }
+  throw new Error('invalid_arguments');
+}
+
+function mcpBridgeCallKey(conversation: string, callId: string): string {
+  return createHash('sha256').update(`${conversation}\0${callId}`).digest('hex');
+}
+
+function mcpBridgeFingerprint(input: McpBridgeCallInput): string {
+  const canonical = canonicalJson({
+    conversationId: input.conversationId,
+    surface: input.surface,
+    name: input.name,
+    args: input.args,
+    agentCommandId: input.agentCommandId ?? null
+  });
+  return createHash('sha256').update(canonical).digest('hex');
+}
+
+function mcpBridgeRequestId(conversation: string, callId: string): string {
+  return `cosmcp_${mcpBridgeCallKey(conversation, callId)}`;
+}
+
+function mcpBridgeLedgerHasAdmissionCapacity(record: McpBridgeCallRecord): boolean {
+  if (mcpBridgeCallRecords.size >= MCP_BRIDGE_MAX_CALLS) return false;
+  const snapshot = mcpBridgeLedgerSnapshot();
+  const actualBytes = Buffer.byteLength(JSON.stringify(snapshot));
+  const admitted = [...mcpBridgeCallRecords.values()].filter((item) => item.state === 'admitted').length;
+  const newBytes = Buffer.byteLength(JSON.stringify(record));
+  return actualBytes + admitted * MCP_BRIDGE_MAX_RESULT_BYTES + newBytes + MCP_BRIDGE_MAX_RESULT_BYTES <= MCP_BRIDGE_MAX_LEDGER_BYTES;
+}
+
+class McpBridgeUpstreamError extends Error {
+  constructor(readonly code: 'unavailable' | 'bad_response' | 'result_too_large', readonly status = 503) {
+    super(code);
+  }
+}
+
+function validateMcpBridgeEndpoint(surface: SurfaceId): string | null {
+  const endpoint = bridgeMcpEndpointUrl(surface);
+  if (!endpoint) return null;
+  try {
+    const url = new URL(endpoint);
+    if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || url.port === '' ||
+        !url.pathname.startsWith(`/mcp/${surface}/`)) return null;
+    return endpoint;
+  } catch {
+    return null;
+  }
+}
+
+async function readMcpBridgeResponse(response: Response, limit: number): Promise<string> {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) {
+        await reader.cancel().catch(() => undefined);
+        throw new McpBridgeUpstreamError('result_too_large', 502);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), total).toString('utf8');
+}
+
+function decodeMcpBridgeResponse(text: string): unknown {
+  const trimmed = text.trim();
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try { return JSON.parse(trimmed) as unknown; } catch { throw new McpBridgeUpstreamError('bad_response', 502); }
+  }
+  const data = [...trimmed.matchAll(/^data:\s*(.*)$/gm)].map((match) => match[1] ?? '').at(-1);
+  if (data !== undefined) {
+    try { return JSON.parse(data) as unknown; } catch { throw new McpBridgeUpstreamError('bad_response', 502); }
+  }
+  throw new McpBridgeUpstreamError('bad_response', 502);
+}
+
+async function mcpBridgeJsonRpc(
+  endpoint: string,
+  surface: SurfaceId,
+  method: 'tools/list' | 'tools/call',
+  params: Record<string, unknown>,
+  requestId?: string
+): Promise<Record<string, unknown>> {
+  const rpcId = randomBytes(16).toString('hex');
+  let response: Response;
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        origin: 'http://127.0.0.1',
+        ...localBridgeHeaders(),
+        ...(requestId ? { 'x-request-id': requestId } : {})
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: rpcId, method, params })
+    });
+  } catch {
+    throw new McpBridgeUpstreamError('unavailable');
+  }
+  let envelope: unknown;
+  try {
+    envelope = decodeMcpBridgeResponse(await readMcpBridgeResponse(response, MCP_BRIDGE_MAX_RESPONSE_BYTES));
+  } catch (error) {
+    if (error instanceof McpBridgeUpstreamError) throw error;
+    throw new McpBridgeUpstreamError('bad_response', 502);
+  }
+  if (!response.ok) throw new McpBridgeUpstreamError('unavailable', 503);
+  if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) throw new McpBridgeUpstreamError('bad_response', 502);
+  const rpc = envelope as Record<string, unknown>;
+  if (rpc['jsonrpc'] !== '2.0' || rpc['id'] !== rpcId || (!('result' in rpc) && !('error' in rpc))) {
+    throw new McpBridgeUpstreamError('bad_response', 502);
+  }
+  // Echoing the surface in this helper makes accidental endpoint/surface mixups visible in tests.
+  void surface;
+  return rpc;
+}
+
+async function completeMcpBridgeCall(record: McpBridgeCallRecord, response: McpBridgeCallResult): Promise<McpBridgeCallResult> {
+  record.state = 'completed';
+  record.response = response;
+  try {
+    await persistMcpBridgeLedger();
+    return response;
+  } catch {
+    // The MCP request may already have mutated the workspace. Keep its durable state at
+    // `admitted` when persistence failed; a retry must report ambiguity, never dispatch twice.
+    record.state = 'admitted';
+    delete record.response;
+    return { status: 503, body: { error: 'call_outcome_unknown' } };
+  }
+}
+
+async function performMcpBridgeCall(input: McpBridgeCallInput, key: string, fingerprint: string): Promise<McpBridgeCallResult> {
+  try {
+    await ensureMcpBridgeLedger();
+  } catch {
+    return { status: 503, body: { error: 'idempotency_state_unavailable' } };
+  }
+  const previous = mcpBridgeCallRecords.get(key);
+  if (previous) {
+    if (previous.fingerprint !== fingerprint) return { status: 409, body: { error: 'call_id_conflict' } };
+    if (previous.state === 'completed' && previous.response) return previous.response;
+    // A process restart may have happened after admission but before the receipt was saved.
+    // This record is deliberately a permanent no-replay fence.
+    return { status: 409, body: { error: 'call_outcome_unknown', callId: input.callId } };
+  }
+
+  const endpoint = validateMcpBridgeEndpoint(input.surface);
+  if (!endpoint) return { status: 503, body: { error: 'mcp_unavailable' } };
+  const session = await findSessionByConversation(input.conversationId, { requireUnique: true });
+  if (!session || session.conversationId !== input.conversationId) {
+    return { status: 409, body: { error: 'unknown_conversation' } };
+  }
+  if (input.agentCommandId) {
+    const agent = bindLeasedWorkerCommandId(input.agentCommandId, input.conversationId);
+    if (!agent || agentForOwnedConversation(input.conversationId) !== agent) {
+      return { status: 409, body: { error: 'invalid_worker_lease' } };
+    }
+  }
+
+  const requestId = mcpBridgeRequestId(input.conversationId, input.callId);
+  const held = requestCorrelation(requestId);
+  if (held && (held.conversationId !== input.conversationId || held.sessionId !== session.id)) {
+    return { status: 409, body: { error: 'request_correlation_conflict' } };
+  }
+  let sessionId: string | null;
+  try {
+    sessionId = await recordRequestEvidence(input.conversationId, [{
+      kind: 'tool_evidence',
+      time: Date.now(),
+      calls: [{ messageId: `cos-mcp:${input.callId}`, tool: input.name, order: 0, answered: false, requestId }]
+    }]);
+  } catch {
+    return { status: 503, body: { error: 'request_correlation_unavailable' } };
+  }
+  const confirmed = requestCorrelation(requestId);
+  const current = await findSessionByConversation(input.conversationId, { requireUnique: true });
+  if (!sessionId || sessionId !== session.id || !confirmed || confirmed.conversationId !== input.conversationId ||
+      confirmed.sessionId !== session.id || !current || current.id !== session.id || current.conversationId !== input.conversationId) {
+    return { status: 409, body: { error: 'request_correlation_unconfirmed' } };
+  }
+
+  const record: McpBridgeCallRecord = {
+    key,
+    fingerprint,
+    callId: input.callId,
+    requestId,
+    state: 'admitted'
+  };
+  if (!mcpBridgeLedgerHasAdmissionCapacity(record)) {
+    return { status: 503, body: { error: 'idempotency_capacity_exhausted' } };
+  }
+  mcpBridgeCallRecords.set(key, record);
+  try {
+    // Commit this boundary before MCP dispatch. If the app dies after this point, we
+    // refuse to replay an admitted call whose external outcome may be unknown.
+    await persistMcpBridgeLedger();
+  } catch {
+    return { status: 503, body: { error: 'idempotency_state_unavailable' } };
+  }
+
+  let rpc: Record<string, unknown>;
+  try {
+    rpc = await mcpBridgeJsonRpc(endpoint, input.surface, 'tools/call', { name: input.name, arguments: input.args }, requestId);
+  } catch (error) {
+    if (error instanceof McpBridgeUpstreamError && error.code === 'result_too_large') {
+      return completeMcpBridgeCall(record, { status: 502, body: { error: 'tool_result_too_large', callId: input.callId } });
+    }
+    return { status: 503, body: { error: 'call_outcome_unknown', callId: input.callId } };
+  }
+  if ('error' in rpc) {
+    const error = rpc['error'];
+    const message = error && typeof error === 'object' && !Array.isArray(error) && typeof (error as Record<string, unknown>)['message'] === 'string'
+      ? String((error as Record<string, unknown>)['message']).slice(0, 1000)
+      : 'MCP request failed';
+    return completeMcpBridgeCall(record, { status: 502, body: { error: 'mcp_call_failed', message } });
+  }
+  const upstreamResult = rpc['result'];
+  if (!upstreamResult || typeof upstreamResult !== 'object' || Array.isArray(upstreamResult)) {
+    return completeMcpBridgeCall(record, { status: 502, body: { error: 'invalid_tool_result', callId: input.callId } });
+  }
+  const result = upstreamResult as Record<string, unknown>;
+  let body: { ok: boolean; content: unknown; isError?: true };
+  try {
+    body = {
+      ok: result['isError'] !== true,
+      content: result['content'] ?? [],
+      ...(result['isError'] === true ? { isError: true as const } : {})
+    };
+    if (Buffer.byteLength(JSON.stringify(body)) > MCP_BRIDGE_MAX_RESULT_BYTES) {
+      return completeMcpBridgeCall(record, { status: 502, body: { error: 'tool_result_too_large', callId: input.callId } });
+    }
+  } catch {
+    return completeMcpBridgeCall(record, { status: 502, body: { error: 'invalid_tool_result', callId: input.callId } });
+  }
+  return completeMcpBridgeCall(record, { status: 200, body });
+}
+
+async function executeMcpBridgeCall(input: McpBridgeCallInput): Promise<McpBridgeCallResult> {
+  let fingerprint: string;
+  try { fingerprint = mcpBridgeFingerprint(input); } catch {
+    return { status: 400, body: { error: 'invalid_arguments' } };
+  }
+  const key = mcpBridgeCallKey(input.conversationId, input.callId);
+  const current = mcpBridgeCallsInFlight.get(key);
+  if (current) {
+    if (current.fingerprint !== fingerprint) return { status: 409, body: { error: 'call_id_conflict' } };
+    return current.work;
+  }
+  const work = Promise.resolve().then(() => performMcpBridgeCall(input, key, fingerprint));
+  mcpBridgeCallsInFlight.set(key, { fingerprint, work });
+  try {
+    return await work;
+  } finally {
+    if (mcpBridgeCallsInFlight.get(key)?.work === work) mcpBridgeCallsInFlight.delete(key);
+  }
+}
+
+function resetMcpBridgeCallsForTests(): void {
+  mcpBridgeCallRecords.clear();
+  mcpBridgeCallsInFlight.clear();
+  mcpBridgeLedgerLoaded = null;
+  mcpBridgeLedgerWrite = Promise.resolve();
 }
 /**
  * Worker/revival transports already removed from live delivery but still kept in durable
@@ -1978,7 +2379,8 @@ export async function stopSessionTurn(sessionId: string, expectedTurnId: string)
     const lifecycle = bridgeLifecycleEpoch;
     // The shared startup owner launches only on positive process absence. An
     // existing browser remains the extension election's responsibility.
-    await wakeBrowserUrl(chatUrl(id), false, getConfig().ui.backgroundChats === true, {
+    const owner = await getSession(sessionId);
+    await wakeBrowserUrl(chatUrl(id, normalizeChatProvider(owner?.provider)), false, getConfig().ui.backgroundChats === true, {
       current: () => bridgeLifecycleEpoch === lifecycle && !bridgeShutdownRequested && commands.includes(command) &&
         Date.now() < command.createdAt + STOP_COMMAND_TIMEOUT_MS &&
         liveConversations().some(row => row.sessionId === sessionId && row.conversationId === id && row.activeTurnId === expectedTurnId)
@@ -2326,6 +2728,96 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // consume the browser's shared budget before failing origin/authentication.
   if (rateLimited()) return json(res, 429, { error: 'rate_limited' }, origin);
   if (noteBrowserSeen(req)) changed();
+
+  if (route === '/mcp-bridge/tools') {
+    if (req.method !== 'GET') return json(res, 405, { error: 'method_not_allowed' }, origin);
+    const requested = url.searchParams.get('surface');
+    if (requested !== null && requested !== 'all' && !SURFACE_IDS.includes(requested as SurfaceId)) {
+      return json(res, 400, { error: 'bad_surface' }, origin);
+    }
+    const available = bridgeMcpEndpointUrls();
+    if (!available) return json(res, 503, { error: 'mcp_unavailable' }, origin);
+    const selected = requested && requested !== 'all'
+      ? [requested as SurfaceId]
+      : SURFACE_IDS.filter((surface) => Boolean(available[surface]));
+    if (selected.length === 0) return json(res, 503, { error: 'mcp_unavailable' }, origin);
+    const listed: Partial<Record<SurfaceId, unknown[]>> = {};
+    for (const surface of selected) {
+      const endpoint = validateMcpBridgeEndpoint(surface);
+      if (!endpoint) return json(res, 503, { error: 'mcp_unavailable', surface }, origin);
+      try {
+        const rpc = await mcpBridgeJsonRpc(endpoint, surface, 'tools/list', {});
+        if ('error' in rpc) return json(res, 502, { error: 'mcp_list_failed', surface }, origin);
+        const result = rpc['result'];
+        const tools = result && typeof result === 'object' && !Array.isArray(result)
+          ? (result as Record<string, unknown>)['tools']
+          : null;
+        if (!Array.isArray(tools) || Buffer.byteLength(JSON.stringify(tools)) > MCP_BRIDGE_MAX_RESPONSE_BYTES) {
+          return json(res, 502, { error: 'invalid_mcp_tool_list', surface }, origin);
+        }
+        listed[surface] = tools;
+      } catch (error) {
+        const status = error instanceof McpBridgeUpstreamError ? error.status : 502;
+        return json(res, status, { error: status === 503 ? 'mcp_unavailable' : 'mcp_list_failed', surface }, origin);
+      }
+    }
+    if (requested && requested !== 'all') {
+      const responseBody = { surface: requested, tools: listed[requested as SurfaceId] ?? [] };
+      if (Buffer.byteLength(JSON.stringify(responseBody)) > MCP_BRIDGE_MAX_RESPONSE_BYTES) {
+        return json(res, 502, { error: 'mcp_tool_list_too_large', surface: requested }, origin);
+      }
+      return json(res, 200, responseBody, origin);
+    }
+    const surfaces = selected.map((surface) => ({ surface, tools: listed[surface] ?? [] }));
+    const tools = surfaces.flatMap(({ surface, tools: rows }) => rows.map((tool) => ({ surface, tool })));
+    const responseBody = { surfaces, tools };
+    if (Buffer.byteLength(JSON.stringify(responseBody)) > MCP_BRIDGE_MAX_RESPONSE_BYTES) {
+      return json(res, 502, { error: 'mcp_tool_list_too_large' }, origin);
+    }
+    return json(res, 200, responseBody, origin);
+  }
+
+  if (route === '/mcp-bridge/call') {
+    if (req.method !== 'POST') return json(res, 405, { error: 'method_not_allowed' }, origin);
+    let body: unknown;
+    try {
+      body = await readBody(req);
+    } catch (error) {
+      if ((error as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, 400, { error: 'bad_request' }, origin);
+    const input = body as Record<string, unknown>;
+    const callId = input['callId'];
+    const conversation = conversationId(input['conversationId']);
+    const surface = input['surface'];
+    const name = input['name'];
+    const args = input['arguments'] === undefined ? {} : input['arguments'];
+    const agentCommandId = input['agentCommandId'];
+    if (typeof callId !== 'string' || callId.length < 1 || callId.length > 200 || /[\u0000-\u0020\u007f]/.test(callId) ||
+        !conversation || typeof surface !== 'string' || !SURFACE_IDS.includes(surface as SurfaceId) ||
+        typeof name !== 'string' || !/^[a-z0-9_.-]{1,64}$/i.test(name) ||
+        !args || typeof args !== 'object' || Array.isArray(args) ||
+        (agentCommandId !== undefined && (typeof agentCommandId !== 'string' || agentCommandId.length < 1 || agentCommandId.length > 200))) {
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    let argumentBytes: number;
+    try {
+      argumentBytes = Buffer.byteLength(canonicalJson(args));
+    } catch {
+      return json(res, 400, { error: 'invalid_arguments' }, origin);
+    }
+    if (argumentBytes > MCP_BRIDGE_MAX_ARGUMENT_BYTES) return json(res, 413, { error: 'arguments_too_large' }, origin);
+    const result = await executeMcpBridgeCall({
+      callId,
+      conversationId: conversation,
+      surface: surface as SurfaceId,
+      name,
+      args: args as Record<string, unknown>,
+      ...(typeof agentCommandId === 'string' ? { agentCommandId } : {})
+    });
+    return json(res, result.status, result.body, origin);
+  }
 
   // Only an explicit login operation accepts a session. Never put cookies in diagnostics,
   // command journals, status snapshots, recorder events or HTTP error descriptions.
@@ -2783,6 +3275,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     const id = conversationId(body['conversationId']);
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
+    if (body['provider'] !== undefined && !CHAT_PROVIDERS.includes(body['provider'] as (typeof CHAT_PROVIDERS)[number]))
+      return json(res, 400, { error: 'bad_provider' }, origin);
+    const provider = normalizeChatProvider(body['provider']);
     const calls = parseCallEvidence(body['calls'], true).filter((call) => call.requestId !== null);
     if (calls.length === 0) return json(res, 400, { error: 'bad_request_evidence' }, origin);
     const reportedAgent = typeof body['agent'] === 'string' && /^[a-z0-9-]{1,40}$/i.test(body['agent'])
@@ -2822,7 +3317,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       : [];
     // Even an already-confirmed mapping must ensure/reuse the chat session, matching /events'
     // first-observation semantics and making this one atomic operation from the page's view.
-    const sessionId = await recordRequestEvidence(id, observations);
+    const sessionId = await recordRequestEvidence(id, observations, provider);
     const confirmed = requestIds.filter((requestId) => requestCorrelation(requestId)?.conversationId === id);
     return json(res, 200, {
       ok: true,
@@ -2844,6 +3339,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     const id = conversationId(body['conversationId']);
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
+    if (body['provider'] !== undefined && !CHAT_PROVIDERS.includes(body['provider'] as (typeof CHAT_PROVIDERS)[number]))
+      return json(res, 400, { error: 'bad_provider' }, origin);
+    const provider = normalizeChatProvider(body['provider']);
     // Normal worker binding happens on the exact command ACK. `/events` is the lost-ACK
     // recovery path, but the friendly id (`worker-1`) is reused by every later swarm and is
     // therefore not enough authority on its own. A command-opened document also carries the
@@ -2891,7 +3389,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           });
         }
       }
-      const result = await recordChatObservations(id, observations, agent);
+      const result = await recordChatObservations(id, observations, agent, provider);
       const superseded = await conversationWasSuperseded(id);
       if (!superseded && !isChatBlocked(id) && result.activity.working && result.activity.at) {
         const woke = result.activity.startedAt !== undefined
@@ -5562,7 +6060,9 @@ function retryUnclaimedBrowserInputs(): Promise<void> {
           latest.pickupRetryCount === 1 && latest.sendAuthorizedAt === undefined && latest.deliveredAt === undefined;
       };
       try {
-        await wakeBrowserUrl(`https://chatgpt.com/c/${encodeURIComponent(row.conversationId)}`, false,
+        const session = await getSession(row.sessionId);
+        if (!session || session.conversationId !== row.conversationId) continue;
+        await wakeBrowserUrl(chatUrl(row.conversationId, normalizeChatProvider(session.provider)), false,
           getConfig().ui.backgroundChats === true, { current: stillOwned });
       } catch (error) {
         logWarn(`recovered browser input ${row.id} remains queued because its chat could not be opened: ${error instanceof Error ? error.message : String(error)}`);
@@ -6328,8 +6828,8 @@ export function setBrowserOpener(open: ((url: string) => Promise<void>) | null):
 }
 
 /** The one place this app writes a ChatGPT conversation URL. */
-export function chatUrl(conversationId: string): string {
-  return `https://chatgpt.com/c/${encodeURIComponent(conversationId)}`;
+export function chatUrl(conversationId: string, provider: ChatProvider = 'chatgpt'): string {
+  return conversationUrl(provider, conversationId);
 }
 
 /** Where the app opens a fresh worker/resume chat. The marker is an id, not a credential. */
@@ -6338,7 +6838,8 @@ export function commandUrl(
   model?: string | null,
   reasoningEffort?: ReasoningEffort | null,
   project?: string | null,
-  sourceConversationId?: string | null
+  sourceConversationId?: string | null,
+  provider: ChatProvider = 'chatgpt'
 ): string {
   // Both a query and a fragment: ChatGPT is a single-page app that rewrites its own URL
   // during boot, and which of the two survives has changed between builds. The content
@@ -6353,12 +6854,12 @@ export function commandUrl(
   //
   // A cold Project-home load can fail in ChatGPT's locked-chat loader. Enter through the
   // source chat and let its native Project link initialize the fresh Project composer.
-  const entry = normalizeProjectId(project) && conversationId(sourceConversationId);
+  const entry = provider === 'chatgpt' && normalizeProjectId(project) && conversationId(sourceConversationId);
   const marker = `clf=${encodeURIComponent(id)}${entry ? '&clf_project=1' : ''}`;
   const params = [marker];
   if (model) params.push(`model=${encodeURIComponent(model)}`);
   if (reasoningEffort) params.push(`reasoning_effort=${encodeURIComponent(reasoningEffort)}`);
-  const base = entry ? chatUrl(entry) : 'https://chatgpt.com/';
+  const base = entry ? chatUrl(entry, provider) : newChatUrl(provider);
   return `${base}?${params.join('&')}#${marker}`;
 }
 
@@ -6593,12 +7094,15 @@ async function captureRecordedBrief(
  * opens a URL in whichever browser it resolves to, which with the extension in two browsers is
  * not necessarily the one chat A is in.
  */
-function offerPlacement(command: Command): boolean {
+async function offerPlacement(command: Command): Promise<boolean> {
   const home = commandHomeConversation(command.spec);
   const worker = command.spec.type === 'worker' && browserWakeConnected();
   const held = command.spec.type === 'resume' && home !== null && chatHolders(home).length > 0;
   if (!worker && !held && (!home || home !== placementCollector)) return false;
-  command.placement = { conversationId: home, background: worker && getConfig().ui.backgroundChats === true };
+  let provider: ChatProvider;
+  try { provider = await providerForCommand(command); } catch { return false; }
+  if (!commands.includes(command) || command.owner !== null) return false;
+  command.placement = { conversationId: home, background: worker && getConfig().ui.backgroundChats === true, provider };
   if (worker || (held && home !== placementCollector)) wakeBrowserWork();
   return true;
 }
@@ -6609,7 +7113,7 @@ function offerPlacement(command: Command): boolean {
  * a replacement's only while that browser holds the replacement's source chat.
  */
 function pendingBrowserPlacement(conversationId: string | null, browser: string | null = null): {
-  id: string; model: string | null; reasoningEffort: ReasoningEffort | null;
+  id: string; provider: ChatProvider; model: string | null; reasoningEffort: ReasoningEffort | null;
   background?: true; active: boolean; homeConversationId: string | null; project: string | null;
 } | null {
   const command = commands.find(entry => entry.owner === null && entry.placement &&
@@ -6624,7 +7128,7 @@ function pendingBrowserPlacement(conversationId: string | null, browser: string 
   const worker = spec.type === 'worker';
   const selection = spec.type === 'resume' ? continuationByToken(spec.token)?.requestedModel : null;
   return {
-    id: command.id, model: worker ? spec.model : selection?.model ?? null,
+    id: command.id, provider: placement.provider, model: worker ? spec.model : selection?.model ?? null,
     reasoningEffort: worker ? spec.reasoningEffort : selection?.reasoningEffort ?? null,
     active: !worker, homeConversationId: placement.conversationId, project: commandProject(command),
     ...(placement.background ? { background: true as const } : {})
@@ -7779,7 +8283,7 @@ function wakeProviderDeferredColdStart(conversationId: string, deferred: Provide
       Date.now() >= repair.notBefore && providerHistoryBackoff(conversationId) === null &&
       !isChatBlocked(conversationId) && !stopRequestedFor(conversationId) &&
       !supersededSourceConversations().includes(conversationId);
-    return wakeBrowserUrl(chatUrl(conversationId), true, getConfig().ui.backgroundChats === true, {
+    return wakeBrowserUrl(chatUrl(conversationId, normalizeChatProvider(session.provider)), true, getConfig().ui.backgroundChats === true, {
       current: () => {
         if (!current()) return false;
         if (repair.reason === 'compaction') {
@@ -7926,7 +8430,7 @@ function queueBrowserRecovery(
         repairsInFlight.get(conversationId) === repair && repair.state === 'queued' &&
         !isChatBlocked(conversationId) && !stopRequestedFor(conversationId) &&
         !supersededSourceConversations().includes(conversationId);
-      return wakeBrowserUrl(chatUrl(conversationId), true, getConfig().ui.backgroundChats === true, {
+      return wakeBrowserUrl(chatUrl(conversationId, normalizeChatProvider(session.provider)), true, getConfig().ui.backgroundChats === true, {
         current: () => {
           if (!current()) return false;
           if (reason === 'compaction') return !!ticket && ticket.from === conversationId &&
@@ -9964,7 +10468,7 @@ async function deliverOne(): Promise<void> {
   // polling. Only that browser can put the new tab in the window the old one is in, and only
   // a tab it creates itself is guaranteed to be in a browser this extension is loaded in.
   try {
-    if (offerPlacement(command)) armPlacementFallback(command);
+    if (await offerPlacement(command)) armPlacementFallback(command);
     else await openFreshChatInBrowser(command);
   } finally {
     scheduleDeliver();
@@ -10042,14 +10546,15 @@ async function openFreshChatInBrowser(command: Command): Promise<void> {
   }
   logInfo(`bridge: opening a fresh ChatGPT chat for ${specKey(command.spec)}`);
   try {
+    const provider = await providerForCommand(command);
     // Stamped whether or not a browser was already running: this process cannot tell the
     // difference, and the window it opens is only ever spent by a browser failing to appear.
     if (!browserPresent()) lastBrowserLaunchAt = Date.now();
     command.progress = { ...command.progress, opened: 'os' };
     await openInBrowser(
       command.spec.type === 'worker'
-        ? commandUrl(command.id, command.spec.model, command.spec.reasoningEffort)
-        : commandUrl(command.id, null, null, commandProject(command), commandHomeConversation(command.spec))
+        ? commandUrl(command.id, command.spec.model, command.spec.reasoningEffort, null, null, provider)
+        : commandUrl(command.id, null, null, commandProject(command), commandHomeConversation(command.spec), provider)
     );
   } catch (err) {
     // One command is one browser-open attempt. A rejected opener can never produce an ACK,
@@ -10060,6 +10565,24 @@ async function openFreshChatInBrowser(command: Command): Promise<void> {
     drop(command, why);
     await deliver();
   }
+}
+
+/** Provider routing follows the exact parent session, never an opaque route id or selected tab. */
+async function providerForCommand(command: Command): Promise<ChatProvider> {
+  if (command.spec.type === 'resume') {
+    const session = await getSession(command.spec.sessionId);
+    // A pre-provider legacy resume has no setting to inherit; its documented migration
+    // default is ChatGPT. Never derive this from the opaque conversation ID.
+    return normalizeChatProvider(session?.provider);
+  }
+  if (command.spec.type === 'worker') {
+    const parentConversation = primeConversation(command.spec.runId);
+    const parent = parentConversation ? await findSessionByConversation(parentConversation, { requireUnique: true }) : null;
+    // Direct/legacy parent chats may predate a local session row. In that case use the
+    // fixed legacy default rather than inferring a provider from the conversation ID.
+    return normalizeChatProvider(parent?.provider);
+  }
+  throw new Error('This command does not open a fresh provider chat');
 }
 
 /**
@@ -10968,6 +11491,7 @@ export function workerBriefForTests(agent: string, task: string): string {
 }
 
 export function resetBridgeForTests(): void {
+  resetMcpBridgeCallsForTests();
   resetApprovalWaits();
   clearCompanionDiagnostics();
   for (const command of commands) if (command.timer) clearTimeout(command.timer);

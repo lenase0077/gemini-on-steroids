@@ -8,6 +8,7 @@ import { imageStorageButton } from './image-storage.js';
 import { applyChatModels, applyComposerSessionModel, initChatModels, confirmedComposerModel, composerSendModel, ensureComposerModel, chatModelName } from './chat-models.js';
 import { marked, Marked, type TokenizerAndRendererExtension } from 'marked';
 import { safeExternalLink } from '../shared/external-link.js';
+import { conversationUrl, normalizeChatProvider } from '../shared/chat-provider.js';
 import { createAgentPanel, workerName } from './agent-panel.js';
 import { createFilePanel } from './file-panel.js';
 import { renderAgentPlan } from './agent-plan.js';
@@ -928,11 +929,13 @@ function sessionRow(summary: SessionSummary): HTMLElement {
     }
     items.push(
       { action: 'rename', icon: 'i-pencil', label: () => t('Rename'), title: () => t("Rename this chat in the app. Its title in ChatGPT stays the same."), run: () => startRename(summary) },
-      { action: 'open', icon: 'i-out', label: () => t('Open in browser'), title: () => t("Open this chat in your browser"), run: () => void run(api.openSessionChat(summary.id)) },
-      // ChatGPT opens /c/<id> wherever the chat lives, a project included (#1107).
-      { action: 'copy-link', icon: 'i-copy', label: () => t('Copy link'), title: () => t("Copy this chat's ChatGPT link"),
-        run: async () => { if (await run(api.writeClipboard(`https://chatgpt.com/c/${summary.conversationId}`))) toast(t('Link copied')); } }
+      { action: 'open', icon: 'i-out', label: () => t('Open in browser'), title: () => t("Open this chat in your browser"), run: () => void run(api.openSessionChat(summary.id)) }
     );
+    // A draft without a provider conversation has no navigable URL to copy yet.
+    if (summary.conversationId) items.push({
+      action: 'copy-link', icon: 'i-copy', label: () => t('Copy link'), title: () => t("Copy this chat's link"),
+      run: async () => { if (await run(api.writeClipboard(conversationUrl(normalizeChatProvider(summary.provider), summary.conversationId!)))) toast(t('Link copied')); }
+    });
     // The stop this app can actually make. It does not touch the running ChatGPT turn — nothing
     // here can — it takes this chat's tools away, and a model whose every call is refused with
     // an instruction to stop finishes its turn on its own.
@@ -5703,7 +5706,7 @@ function applyAutoCompactHint(config: Config): void {
  * expire by age.
  */
 const CHAT_INPUTS = [
-  'chatBrowser', 'browserBridgePort',
+  'chatBrowser', 'newChatProvider', 'browserBridgePort',
   'goalIncludeToolCalls',
   'planBackend',
   'finishTool', 'finishLeadMinutes', 'defaultChatModel', 'defaultChatReasoning', 'workerModel', 'workerReasoning', 'autoSelectSkills', 'backgroundChats', 'backgroundPlacement', 'browserOnly', 'autoRefreshPlugins',

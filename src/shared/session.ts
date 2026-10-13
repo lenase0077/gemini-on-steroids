@@ -633,6 +633,8 @@ export function originTitle(origin: SessionOrigin, source: string | null): strin
 }
 
 export interface SessionSummary {
+  /** Native chat frontend fixed when this local session is accepted; legacy summaries normalize to ChatGPT. */
+  provider?: import('./chat-provider.js').ChatProvider;
   /** Rebuildable transcript boundaries; no message bodies or execution authority. */
   timelineTurns?: import('./chronology.js').TimelineTurns;
   /** Rebuildable request-to-turn proof from recorded MCP calls, never a caller permission. */
@@ -653,7 +655,7 @@ export interface SessionSummary {
   id: string;
   title: string;
   /**
-   * The ChatGPT conversation this session is attached to *right now*.
+   * The provider conversation this session is attached to *right now*.
    *
    * The local session is the durable identity; a ChatGPT chat is only the frontend
    * currently attached to it. Compact & Resume moves this from chat A to chat B in one
@@ -661,7 +663,7 @@ export interface SessionSummary {
    */
   conversationId: string | null;
   /**
-   * Every ChatGPT conversation this session has lived in, oldest first, current last.
+   * Every provider conversation this session has lived in, oldest first, current last.
    *
    * Kept so a recorded history that spans a compaction can still be traced back to the
    * chats it was written in, and so a stale tab reporting for a superseded conversation

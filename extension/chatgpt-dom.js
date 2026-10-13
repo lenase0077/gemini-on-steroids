@@ -1,5 +1,5 @@
 /**
- * Everything that knows what ChatGPT's page looks like.
+ * Everything that knows what a supported provider's page looks like.
  *
  * This is the only file that will break when ChatGPT changes, which is why it is the
  * only file allowed to contain a selector. Every function returns a safe empty value
@@ -62,6 +62,424 @@ var CLF_DOM = (() => {
       return fallback;
     }
   };
+
+  // Gemini's Angular/Material page has no React Fiber to inspect. Keep its adapter
+  // deliberately separate from the ChatGPT selectors below, and expose only the
+  // DOM-backed subset that content.js can verify on this provider.
+  if (String(location.hostname || '').toLowerCase() === 'gemini.google.com') {
+    return createGeminiDom();
+  }
+
+  function createGeminiDom() {
+    const TURN_SELECTOR = 'user-query, [data-test-id="user-query"], model-response, [data-test-id="model-response"]';
+    const USER_TEXT = '.query-text, .user-query-bubble-with-background';
+    const ASSISTANT_TEXT = 'message-content, .model-response-text, .markdown';
+    const COMPOSER_SELECTOR = 'rich-textarea div.ql-editor[contenteditable="true"], div.ql-editor[contenteditable="true"][role="textbox"], rich-textarea [contenteditable="true"]';
+    const SEND_SELECTOR = 'button.send-button, button[aria-label*="Send" i], button[aria-label*="Enviar" i], .send-button-container button:not([disabled])';
+    const STOP_SELECTOR = 'button.stop, button[aria-label*="Stop" i], button[aria-label*="Detener" i], .send-button.stop';
+    const NEW_CHAT_SELECTOR = 'a[href="/app"], [data-test-id="new-chat-button"], button[aria-label*="New chat" i], button[aria-label*="Nuevo chat" i]';
+    const THOUGHT_SELECTOR = 'model-thoughts';
+    const MAX_TURNS = 400;
+    const MAX_MESSAGE_TEXT = 64_000;
+    const MAX_TOTAL_TEXT = 1024 * 1024;
+    let nextTurnId = 1;
+
+    const compact = value => String(value || '').replace(/\s+/g, '');
+    const cleanText = value => String(value || '').replace(/\u00a0/g, ' ').replace(/\r\n?/g, '\n').trim();
+    const safeQueryAll = (root, selector) => safe(() => [...(root?.querySelectorAll?.(selector) || [])], []);
+    const visible = node => safe(() => {
+      if (!node || node.disabled || node.getAttribute?.('aria-disabled') === 'true' ||
+          node.closest?.('[hidden], [aria-hidden="true"], [inert]')) return false;
+      if (typeof node.getClientRects === 'function' && node.getClientRects().length === 0) return false;
+      return true;
+    }, false);
+    const roleOf = node => {
+      const tag = String(node?.tagName || '').toLowerCase();
+      const testId = String(node?.getAttribute?.('data-test-id') || '').toLowerCase();
+      if (tag === 'user-query' || testId === 'user-query') return 'user';
+      if (tag === 'model-response' || testId === 'model-response') return 'assistant';
+      return null;
+    };
+    const turnNodes = () => {
+      const seen = new Set();
+      return safeQueryAll(document, TURN_SELECTOR).filter(node => {
+        const role = roleOf(node);
+        if (!role || seen.has(node)) return false;
+        seen.add(node);
+        return true;
+      }).slice(-MAX_TURNS);
+    };
+    const ensureTurnId = (node, index) => {
+      let id = String(node?.getAttribute?.('data-turn-key') || '').trim();
+      if (!id && node?.id) id = `gemini-turn:${String(node.id).slice(0, 160)}`;
+      if (!id) id = `gemini-turn-${nextTurnId++}`;
+      if (id.length > 200) id = id.slice(0, 200);
+      if (node?.getAttribute?.('data-turn-key') !== id) node?.setAttribute?.('data-turn-key', id);
+      // Keep the positional index available only as display metadata, never as identity.
+      if (node?.getAttribute?.('data-clf-gemini-order') !== String(index)) node?.setAttribute?.('data-clf-gemini-order', String(index));
+      return id;
+    };
+    const messageIdFor = node => {
+      const existing = String(node?.getAttribute?.('data-clf-gemini-message-id') || '').trim();
+      if (existing) return existing.slice(0, 200);
+      const role = roleOf(node) || 'message';
+      const turnId = String(node?.getAttribute?.('data-turn-key') || '').trim();
+      const id = node?.id ? `${role}:${String(node.id).slice(0, 160)}` : `${turnId || 'gemini-message'}:message`;
+      const bounded = id.slice(0, 200);
+      node?.setAttribute?.('data-clf-gemini-message-id', bounded);
+      return bounded;
+    };
+    const mcpCodeBlocks = root => safe(() => {
+      const scope = root?.matches?.('model-response, [data-test-id="model-response"]')
+        ? root
+        : root?.closest?.('model-response, [data-test-id="model-response"]');
+      if (!scope) return [];
+      const blocks = [];
+      const seen = new Set();
+      const add = (code, marked, index) => {
+        if (!code || seen.has(code)) return;
+        seen.add(code);
+        const text = typeof code.textContent === 'string' ? code.textContent.trim() : '';
+        if (text) blocks.push({ index, text, marked });
+      };
+      let index = 0;
+      for (const block of safeQueryAll(scope, 'code-block')) {
+        const language = safeQueryAll(block, '.code-block-decoration span, [data-test-id="code-block-language"]')
+          .map(node => cleanText(node.textContent).toLowerCase()).find(Boolean) || '';
+        if (language !== 'cos-mcp') continue;
+        const code = safeQueryAll(block, 'pre > code, pre code').find(node => node.textContent);
+        add(code, true, index++);
+      }
+      for (const code of safeQueryAll(scope, 'pre > code')) {
+        const language = [...(code.classList || [])].find(name => name.startsWith('language-'))?.slice('language-'.length)?.toLowerCase() || '';
+        add(code, language === 'cos-mcp', index++);
+      }
+      return blocks.slice(0, 32);
+    }, []);
+    const textIn = (node, selectors) => safe(() => {
+      for (const selector of selectors.split(', ')) {
+        const candidate = node?.querySelector?.(selector);
+        if (candidate) {
+          const value = cleanText(typeof candidate.innerText === 'string' ? candidate.innerText : candidate.textContent);
+          if (value) return value.slice(0, MAX_MESSAGE_TEXT);
+        }
+      }
+      // The provider's semantic message container is a safe fallback. Do not count its
+      // edit/send controls as authored text when a partial page omits the content anchor.
+      const clone = node?.cloneNode?.(true);
+      if (clone?.querySelectorAll) for (const control of clone.querySelectorAll('button')) control.remove();
+      const source = clone || node;
+      return cleanText(typeof source?.innerText === 'string' ? source.innerText : source?.textContent).slice(0, MAX_MESSAGE_TEXT);
+    }, '');
+    const messageText = node => roleOf(node) === 'user' ? textIn(node, USER_TEXT) : textIn(node, ASSISTANT_TEXT);
+    const currentTurns = () => turnNodes().map((node, index) => {
+      const id = ensureTurnId(node, index);
+      return { node, nodes: [node], id, role: roleOf(node) };
+    });
+    const turnIdOf = node => safe(() => {
+      if (!roleOf(node)) return null;
+      const index = turnNodes().indexOf(node);
+      return ensureTurnId(node, index < 0 ? 0 : index);
+    }, null);
+    const messageIdOf = node => safe(() => {
+      if (!roleOf(node)) return null;
+      turnIdOf(node);
+      return messageIdFor(node);
+    }, null);
+    const userPromptText = value => {
+      const source = String(value || '').replace(/\r\n?/g, '\n');
+      const prefix = /^(?:\[\[CLF-(?:HANDOFF|RESUME):[A-Za-z0-9_-]{16,64}\]\]\n\n)?/.exec(source)?.[0] || '';
+      const header = /^\[\[COS_CONTEXT:(\d{1,6})\]\]\n/.exec(source.slice(prefix.length));
+      if (!header) return null;
+      const end = prefix.length + header[0].length + Number(header[1]);
+      const boundary = '\n[[/COS_CONTEXT]]\n\n';
+      return source.startsWith(boundary, end) ? prefix + source.slice(end + boundary.length) : null;
+    };
+    const messagesIn = (turn, index = 0, seen = new Set()) => safe(() => {
+      if (!turn?.node || !['user', 'assistant'].includes(turn.role)) return [];
+      const id = messageIdOf(turn.node);
+      if (!id || seen.has(id)) return [];
+      seen.add(id);
+      return [{ id, role: turn.role, text: messageText(turn.node), turnId: turn.id, node: turn.node, interrupted: false, index }];
+    }, []);
+    const messages = () => {
+      const seen = new Set();
+      return currentTurns().flatMap((turn, index) => messagesIn(turn, index, seen));
+    };
+    const latestAssistant = () => [...turnNodes()].reverse().find(node => roleOf(node) === 'assistant') || null;
+    const composer = () => safe(() => document.querySelector(COMPOSER_SELECTOR), null);
+    const composerAuthoredText = () => safe(() => cleanText(composer()?.innerText ?? composer()?.textContent), '');
+    const composerVisible = () => visible(composer());
+    const composerWritable = () => {
+      const box = composer();
+      return Boolean(box && box.getAttribute?.('aria-disabled') !== 'true' && box.getAttribute?.('contenteditable') !== 'false' && composerVisible());
+    };
+    const stopButton = () => safe(() => safeQueryAll(document, STOP_SELECTOR).find(visible) || null, null);
+    const sendButton = () => safe(() => safeQueryAll(document, SEND_SELECTOR).find(button => visible(button) && button !== stopButton()) || null, null);
+    const generating = () => safe(() => Boolean(stopButton() || safeQueryAll(latestAssistant(), '[aria-busy="true"], .result-streaming').some(visible)), false);
+    const sendButtonEnabled = button => Boolean(button && visible(button));
+    const dispatchInput = (box, value, inputType = 'insertText') => {
+      try {
+        if (typeof InputEvent === 'function') box.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType, data: value }));
+        else if (typeof Event === 'function') box.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+      } catch { /* The DOM edit already happened; an unavailable event constructor is not fatal. */ }
+    };
+    const writeEditor = (box, value) => {
+      box.focus?.();
+      let inserted = false;
+      try {
+        if (typeof document.execCommand === 'function') {
+          document.execCommand('selectAll', false);
+          inserted = document.execCommand('insertText', false, value) === true;
+        }
+      } catch { inserted = false; }
+      if (!inserted) {
+        box.textContent = value;
+        try { box.innerText = value; } catch { /* contenteditable may expose a read-only innerText */ }
+      }
+      dispatchInput(box, value);
+      return compact(composerAuthoredText()) === compact(value);
+    };
+    const clearEditor = (box, value) => {
+      if (!box || compact(composerAuthoredText()) !== compact(value)) return false;
+      box.focus?.();
+      let deleted = false;
+      try {
+        if (typeof document.execCommand === 'function') {
+          document.execCommand('selectAll', false);
+          deleted = document.execCommand('delete', false) === true;
+        }
+      } catch { deleted = false; }
+      if (!deleted) {
+        box.textContent = '';
+        try { box.innerText = ''; } catch { /* contenteditable may expose a read-only innerText */ }
+      }
+      dispatchInput(box, null, 'deleteContentBackward');
+      return composerAuthoredText() === '';
+    };
+    const insertPrompt = (value, mode = false, failure = () => undefined) => {
+      const box = composer();
+      const reject = reason => { safe(() => failure(reason), undefined); return false; };
+      if (!box) return reject('composer_missing');
+      const existing = composerAuthoredText();
+      if (value === '' && mode !== true) return false;
+      const same = compact(existing) === compact(value);
+      if (existing && mode === false && !same) return reject('existing_draft');
+      const next = mode === 'append' && existing ? `${existing}\n${value}` : String(value || '');
+      if (!writeEditor(box, next)) return reject('text_mismatch');
+      return true;
+    };
+    const clearPromptExact = value => safe(() => clearEditor(composer(), value), false);
+    const captureComposerDraft = (value, stillCurrent = () => true) => {
+      let box = composer(), touched = false, rebound = false;
+      const onEdit = event => { if (event?.isTrusted) touched = true; };
+      const events = ['input', 'change', 'keydown', 'pointerdown', 'paste', 'drop'];
+      for (const name of events) box?.addEventListener?.(name, onEdit, true);
+      const current = () => !touched && Boolean(stillCurrent()) && composer() === box && box?.isConnected !== false &&
+        compact(composerAuthoredText()) === compact(value);
+      const remove = () => { for (const name of events) box?.removeEventListener?.(name, onEdit, true); };
+      return {
+        attachments() {},
+        current,
+        async clear() { return current() && clearPromptExact(value); },
+        rebind() {
+          if (rebound || touched || !stillCurrent()) return false;
+          const replacement = composer();
+          if (!replacement || replacement === box || compact(cleanText(replacement.innerText ?? replacement.textContent)) !== compact(value)) return false;
+          remove(); box = replacement; rebound = true;
+          for (const name of events) box?.addEventListener?.(name, onEdit, true);
+          return current();
+        },
+        dispose: remove,
+        withdraw() { return !touched && clearPromptExact(value); }
+      };
+    };
+    const stopGeneration = stillCurrent => {
+      if (typeof stillCurrent === 'function' && !stillCurrent()) return false;
+      const button = stopButton();
+      if (!button) return false;
+      button.click?.();
+      return true;
+    };
+    const send = async ({ acceptanceTimeoutMs = 30000, receiptTimeoutMs = null, stillCurrent = () => true, matchesUser = null,
+      acceptUserReceipt = null, beforeSend = null, explain = null, whileGenerating = false, onSendClick = null } = {}) => {
+      const refuse = reason => { safe(() => explain?.(reason), undefined); return false; };
+      const box = composer();
+      if (!box || !composerWritable()) return refuse('editor-missing');
+      if (!stillCurrent()) return refuse('chat-changed');
+      if (generating() && !whileGenerating) return refuse('page-busy');
+      const submitted = composerAuthoredText();
+      if (!submitted) return refuse('draft-empty');
+      const previous = new Set(messages().filter(message => message.role === 'user').map(message => message.id));
+      try { if (beforeSend && await beforeSend(() => stillCurrent()) !== true) return refuse('send-not-authorized'); }
+      catch { return refuse('send-not-authorized'); }
+      if (!stillCurrent() || composer() !== box || compact(composerAuthoredText()) !== compact(submitted)) return refuse('draft-changed');
+      const button = sendButton();
+      if (!button || !sendButtonEnabled(button)) return refuse('send-not-ready');
+      try { button.click(); } catch { return refuse('send-click-failed'); }
+      try { onSendClick?.(); } catch { /* Send authority was already exercised; diagnostics stay non-fatal. */ }
+      const timeout = Number.isFinite(receiptTimeoutMs) && receiptTimeoutMs > 0 ? receiptTimeoutMs : acceptanceTimeoutMs;
+      const deadline = Date.now() + Math.max(0, Math.min(timeout, 30000));
+      while (Date.now() <= deadline) {
+        if (!stillCurrent()) return refuse('chat-changed');
+        const freshUser = messages().filter(message => message.role === 'user' && !previous.has(message.id)).at(-1);
+        if (freshUser && (matchesUser ? matchesUser(freshUser, submitted) : compact(freshUser.text) === compact(submitted))) {
+          if (acceptUserReceipt && acceptUserReceipt(freshUser, conversationId()) !== true) {
+            await new Promise(resolve => setTimeout(resolve, 25));
+            continue;
+          }
+          return true;
+        }
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      return refuse('not-accepted');
+    };
+    const conversationFromPath = pathname => safe(() => {
+      const match = /^\/app\/([0-9a-f]{16})\/?$/i.exec(String(pathname || ''));
+      return match ? match[1] : null;
+    }, null);
+    const fiberRef = node => safe(() => {
+      const value = node?.getAttribute?.('data-clf-fiber') || '';
+      const match = /^([^:]{1,100}):(\d+)$/.exec(value);
+      return match ? { scanToken: match[1], index: Number(match[2]) } : null;
+    }, null);
+    const stampFiberScan = nonce => {
+      const snapshot = currentTurns();
+      const start = Math.max(0, snapshot.length - 6);
+      const turns = [];
+      let budget = MAX_TOTAL_TEXT;
+      for (let at = start; at < snapshot.length; at++) {
+        const turn = snapshot[at];
+        const index = at - start;
+        const stamp = `${nonce}:${index}`;
+        const id = messageIdOf(turn.node);
+        turn.node?.setAttribute?.('data-clf-fiber-turn', stamp);
+        turn.node?.setAttribute?.('data-clf-fiber-message', `${stamp}:${encodeURIComponent(id)}`);
+        if (turn.role === 'user') turn.node?.setAttribute?.('data-clf-fiber-user', `${stamp}:${encodeURIComponent(id)}`);
+        const text = messageText(turn.node).slice(0, Math.min(MAX_MESSAGE_TEXT, budget));
+        budget -= text.length;
+        const isCurrentAssistant = turn.role === 'assistant' && turn.node === latestAssistant();
+        const stable = turn.role === 'user' || !(isCurrentAssistant && generating());
+        const message = { messageId: id, rawMessageId: id, role: turn.role, stable, order: index,
+          rawText: text, sectionIndex: 0 };
+        turns.push({ index, turnId: turn.id, messages: [message], ...(turn.role === 'assistant' && stable ? { endMessageId: id } : {}) });
+      }
+      for (const thought of safeQueryAll(document, THOUGHT_SELECTOR)) {
+        let owner = thought.parentElement;
+        while (owner && roleOf(owner) !== 'assistant') owner = owner.parentElement;
+        const ownerTurn = snapshot.find(turn => turn.node === owner);
+        if (!ownerTurn) continue;
+        const index = snapshot.slice(start).indexOf(ownerTurn);
+        if (index < 0 || index >= 6) continue;
+        thought.setAttribute?.('data-clf-fiber-thought', `${nonce}:${index}:${encodeURIComponent(messageIdOf(owner))}`);
+      }
+      return { turns, start };
+    };
+
+    // The request nonce and same-document checks mirror fiber.js. This reply is a bounded
+    // DOM observation only; it never fabricates connector calls, request ids or tool authority.
+    safe(() => window.addEventListener('message', event => {
+      if (event?.source !== window || event.origin !== location.origin) return;
+      const request = event.data;
+      if (!request || typeof request !== 'object' || request.source !== 'clf-fiber-ask' ||
+          typeof request.nonce !== 'string' || request.nonce.length < 1 || request.nonce.length > 100) return;
+      const { turns } = stampFiberScan(request.nonce);
+      window.postMessage({ source: 'clf-fiber-reply', nonce: request.nonce, v: 22,
+        scanOk: true, scanToken: request.nonce, rows: [], turns }, location.origin);
+    }), undefined);
+
+    const empty = () => [];
+    const no = () => false;
+    const none = () => null;
+    return {
+      TURN_SELECTOR,
+      AUTHORED_SELECTOR: `${USER_TEXT}, ${ASSISTANT_TEXT}`,
+      turnIdOf,
+      messageIdOf,
+      composerAuthoredText,
+      userPromptText,
+      userMessageReaction: () => undefined,
+      presentUserPrompts: () => undefined,
+      composerVisible,
+      conversationLoadFailure: none,
+      prepareChatModelSurface: async stillCurrent => Boolean(stillCurrent?.() !== false && composerVisible()),
+      modelPickerReadable: async () => false,
+      newChatControl: async stillCurrent => stillCurrent?.() === false ? null : safe(() => safeQueryAll(document, NEW_CHAT_SELECTOR).find(visible) || null, null),
+      projectCreateControl: none,
+      projectCreateForm: none,
+      revealSidebar: () => true,
+      projectIdsShown: empty,
+      fillProjectName: no,
+      projectHomeId: none,
+      enterProject: no,
+      visibleModelSelection: none,
+      inspectModelSettings: async () => null,
+      uploadImages: async (images, stillCurrent = () => true, _draft = null, files = []) =>
+        (!images?.length && !files.length && stillCurrent()),
+      captureComposerDraft,
+      hasComposerAttachments: no,
+      composerAttachmentNames: empty,
+      pluginRefreshView: async () => null,
+      setConnectorNames: () => undefined,
+      setConnectorApps: () => undefined,
+      connectorApps: empty,
+      connectorNames: empty,
+      pluginInstalledButtons: empty,
+      pluginManagementIdle: () => true,
+      selectModelSettings: async (model, effort, stillCurrent = () => true) =>
+        (!model && !effort && stillCurrent()),
+      temporaryChatReady: no,
+      confirmTemporaryChatIntroduction: () => undefined,
+      conversationId: () => conversationFromPath(location.pathname),
+      conversationFromPath,
+      isNewChatPage: () => /^\/app\/?$/i.test(String(location.pathname || '')) && !conversationFromPath(location.pathname),
+      conversationTitle: () => safe(() => String(document.title || '').replace(/\s*[-|·]\s*Gemini\s*$/i, '').trim().slice(0, 200), ''),
+      turns: currentTurns,
+      presentationTurns: currentTurns,
+      messages,
+      messagesIn,
+      mcpCodeBlocks,
+      sectionSignature: node => `${messageText(node).length}|${messageText(node).slice(-96)}`,
+      generating,
+      approvalWaiting: no,
+      stopButton,
+      stopGeneration,
+      sendButton,
+      progressLine: none,
+      progressItems: empty,
+      interrupted: no,
+      markProgress: () => 0,
+      toolBlocks: empty,
+      activityItems: empty,
+      isConnectorBlock: no,
+      markLocalBlock: no,
+      hasConnectorRow: no,
+      connectorRows: empty,
+      fiberRef,
+      activitySummaryRows: empty,
+      thoughtActivityRows: empty,
+      toolLabel: node => cleanText(node?.textContent).slice(0, 300),
+      errors: empty,
+      composer,
+      composerSubmitReady: () => Boolean(composerWritable() && !generating() && !composerAuthoredText()),
+      clearRevivalResidue: no,
+      composerWritable,
+      composerBox: () => safe(() => composer()?.closest?.('form') || composer()?.parentElement || null, null),
+      pageTheme: none,
+      composerActions: () => ({ host: safe(() => composer()?.closest?.('form') || composer()?.parentElement || composer(), null) }),
+      composerStack: () => safe(() => composer()?.parentElement || null, null),
+      firstUserMessage: () => messages().find(message => message.role === 'user')?.node || null,
+      hideProgress: () => undefined,
+      hideActivity: () => false,
+      activityFold: none,
+      collapsedActivityFold: none,
+      canHideActivity: no,
+      replaceActivity: no,
+      insertPrompt,
+      clearPromptExact,
+      send
+    };
+  }
 
   const text = (node, cap = 256_000) =>
     node ? (node.textContent || '').replace(/ /g, ' ').trim().slice(0, cap) : '';
@@ -393,7 +811,7 @@ var CLF_DOM = (() => {
   }
 
   /**
-   * The conversation a ChatGPT path names, or null when it names none.
+   * The conversation a supported provider path names, or null when it names none.
    *
    * A conversation inside a Project is routed as `/g/<project>/c/<id>`, so anchoring at
    * `/c/` recognised only chats at the site root. Everything downstream — the app session,
@@ -402,12 +820,20 @@ var CLF_DOM = (() => {
    *
    * Deliberately not a loose `/c/<id>` search anywhere in the path: `/share/c/<id>` is a
    * public read-only snapshot of someone's conversation, not a conversation this document
-   * can own, record or bind. One optional `/g/<slug>` segment is the whole exception.
+   * can own, record or bind. Gemini names active chats as `/app/<16-hex-id>`; bare `/app`
+   * remains an unbound new chat.
    */
   function conversationFromPath(pathname) {
     return safe(() => {
-      const match = /^\/(?:g\/[^/]+\/)?c\/([0-9a-f-]{8,64})(?:\/|$)/i.exec(String(pathname || ''));
-      return match ? match[1] : null;
+      const path = String(pathname || '');
+      const hostname = String(location.hostname || '').toLowerCase();
+      if (hostname === 'gemini.google.com') {
+        const gemini = /^\/app\/([0-9a-f]{16})\/?$/i.exec(path);
+        return gemini ? gemini[1] : null;
+      }
+      if (hostname !== 'chatgpt.com' && hostname !== 'chat.openai.com') return null;
+      const chatgpt = /^\/(?:g\/[^/]+\/)?c\/([0-9a-f-]{8,64})(?:\/|$)/i.exec(path);
+      return chatgpt ? chatgpt[1] : null;
     }, null);
   }
 
@@ -2417,7 +2843,7 @@ var CLF_DOM = (() => {
     }
   }
 
-  async function send({ acceptanceTimeoutMs = 30000, stillCurrent = () => true, matchesUser = null, observeEvidence = null, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null, receiptTimeoutMs = null, mention = null, explain = null, sentRequest = null, whileGenerating = false } = {}) {
+  async function send({ acceptanceTimeoutMs = 30000, stillCurrent = () => true, matchesUser = null, observeEvidence = null, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null, receiptTimeoutMs = null, mention = null, explain = null, sentRequest = null, whileGenerating = false, onSendClick = null } = {}) {
     // Why a Send ended without acceptance, as one short code for the caller's diagnostics (#820).
     // It names the first refusal only and never changes what Send does.
     const refused = (why) => { try { explain?.(why); } catch { /* Diagnostics never change Send. */ } return false; };
@@ -2602,6 +3028,7 @@ var CLF_DOM = (() => {
             }
             clickedAt = Date.now();
             try { control.click(); } catch { return finish(false); }
+            try { onSendClick?.(); } catch { /* The native click is already the one-way boundary. */ }
             check(); // Synchronous navigation/cancellation during click also re-proves ownership.
           };
           if (!beforeSend) return click();
@@ -3473,6 +3900,7 @@ var CLF_DOM = (() => {
     },
     conversationId,
     conversationFromPath,
+    isNewChatPage: () => !conversationId() && location.pathname === '/',
     conversationTitle,
     turns,
     presentationTurns,

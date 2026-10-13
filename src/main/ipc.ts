@@ -16,6 +16,7 @@ import { installRecommendedSkill, listRecommendedSkills } from './recommended-sk
 import { noteChatOrigin } from './session/recorder.js';
 import { committedResumeAncestorsFromSummary, REASONING_EFFORTS, type SessionChange } from '../shared/session.js';
 import { safeExternalLink } from '../shared/external-link.js';
+import { CHAT_PROVIDERS, conversationUrl, newChatUrl, normalizeChatProvider } from '../shared/chat-provider.js';
 import { wakeBrowserWork } from './browser-wake.js';
 import { getChatModels, startChatModelDiscovery, configureChatModelDiscovery } from './chat-models.js';
 import { releaseSessionFinish, requestSessionFinishGoal } from './session/finish.js';
@@ -98,7 +99,6 @@ import {
   recoveryHeldByCalls, recoveryInputAllowed,
   sessionControlsFor, cancelAssistantRecovery, stopSessionTurn, setSessionAutomation, setSessionObjective, compactSession, resumeFromSavedSummary, cancelSessionCompaction,
   cancelWorkerCommands,
-  chatUrl,
   revealChatInBrowser,
   pendingCommands,
   onBridgeChange,
@@ -118,6 +118,7 @@ import {
   clearSessionName,
   renameSession,
   getSession,
+  findSessionByConversation,
   getImageStorage,
   readHandoff,
   readToolEditReview,
@@ -206,6 +207,7 @@ const settingsPatch = z.object({
     appearance: appearanceSchema.optional(),
     autoContinue: z.boolean().optional(),
     defaultChatModel: z.string().trim().min(1).max(80).optional(),
+    newChatProvider: z.enum(CHAT_PROVIDERS).optional(),
     defaultChatReasoning: z.enum(REASONING_EFFORTS).optional(),
     chatBrowser: z.enum(CHAT_BROWSERS).optional(),
     developerMode: z.boolean().optional(),
@@ -373,6 +375,7 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       appearance: mergeAppearance(current.ui.appearance, base.ui.appearance, wanted.ui.appearance),
       autoContinue: pick(current.ui.autoContinue, base.ui.autoContinue, wanted.ui.autoContinue),
       defaultChatModel: pick(current.ui.defaultChatModel, base.ui.defaultChatModel, wanted.ui.defaultChatModel),
+      newChatProvider: pick(current.ui.newChatProvider, base.ui.newChatProvider, wanted.ui.newChatProvider),
       defaultChatReasoning: pick(current.ui.defaultChatReasoning, base.ui.defaultChatReasoning, wanted.ui.defaultChatReasoning),
       chatBrowser: pick(current.ui.chatBrowser, base.ui.chatBrowser, wanted.ui.chatBrowser),
       developerMode: pick(current.ui.developerMode, base.ui.developerMode, wanted.ui.developerMode),
@@ -570,16 +573,16 @@ function handle<T>(channel: string, fn: (payload: unknown) => Promise<T>): void 
   });
 }
 
-/** Shows a recorded chat's ChatGPT page: its open tab when there is one, else a new one. */
+/** Shows a recorded provider chat: its open tab when there is one, else a new one. */
 export async function openSessionChat(id: string): Promise<void> {
   const summary = await getSession(id);
   const conversationId = summary?.conversationId;
   if (!conversationId || !/^[0-9a-z-]{8,64}$/i.test(conversationId)) {
-    throw new Error('This session has no valid ChatGPT conversation');
+    throw new Error('This session has no valid provider conversation');
   }
   // The extension's own browser first: the OS may pick another browser or account (#882).
   // An explicit user action: only the CoS browser uses `reveal`, to bring its window forward.
-  if (!(await revealChatInBrowser(conversationId))) await openInPreferredBrowser(chatUrl(conversationId), { reveal: true });
+  if (!(await revealChatInBrowser(conversationId))) await openInPreferredBrowser(conversationUrl(normalizeChatProvider(summary.provider), conversationId), { reveal: true });
 }
 
 export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall: () => void): void {
@@ -1236,9 +1239,13 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
 
   // Installation does not change the saved execution browser or load the CoS host.
   handle('browser:setupOpen', async (payload) => {
-    const { browser, page } = z.object({ browser: z.enum(['chrome', 'edge', 'brave']), page: z.enum(['extensions', 'chatgpt']) }).strict().parse(payload);
+    const { browser, page } = z.object({ browser: z.enum(['chrome', 'edge', 'brave']), page: z.enum(['extensions', 'chatgpt', 'gemini']) }).strict().parse(payload);
     if (page === 'chatgpt') {
       await openInPreferredBrowser('https://chatgpt.com/', { browser, reveal: true });
+      return true;
+    }
+    if (page === 'gemini') {
+      await openInPreferredBrowser(newChatUrl('gemini'), { browser, reveal: true });
       return true;
     }
     // A browser opens its own internal pages only from its address bar: given on the command line,
@@ -1824,8 +1831,12 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       if (!await startBridge()) throw new Error('The browser bridge could not start');
       signal.throwIfAborted();
       const marker = `cos-input=${encodeURIComponent(entry.id)}`;
-      await wakeBrowserUrl(entry.conversationId ? `https://chatgpt.com/c/${encodeURIComponent(entry.conversationId)}`
-        : `https://chatgpt.com/?${entry.lifetime === 'temporary-planner' ? 'temporary-chat=true&' : ''}${marker}#${marker}`);
+      const source = entry.decisionSourceSessionId ? await getSession(entry.decisionSourceSessionId) : null;
+      const active = entry.conversationId ? await findSessionByConversation(entry.conversationId, { requireUnique: true }) : null;
+      const provider = normalizeChatProvider(active?.provider ?? source?.provider);
+      const base = entry.conversationId ? conversationUrl(provider, entry.conversationId) : newChatUrl(provider);
+      await wakeBrowserUrl(entry.conversationId ? base
+        : `${base}?${entry.lifetime === 'temporary-planner' && provider === 'chatgpt' ? 'temporary-chat=true&' : ''}${marker}#${marker}`);
     },
     bindHelper: async (conversationId, fromSessionId) => {
       const source = fromSessionId ? await getSession(fromSessionId) : null;

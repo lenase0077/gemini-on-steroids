@@ -151,6 +151,35 @@ describe('connection surface state', () => {
     vi.resetModules();
   });
 
+  it('publishes only the live endpoint URLs for the MCP bridge gateway', async () => {
+    const connection = await import('../src/main/connection.js');
+    const { bridgeMcpEndpointUrls } = await import('../src/main/mcp/bridge-endpoint.js');
+    expect(bridgeMcpEndpointUrls()).toBeNull();
+    await connection.connect();
+    expect(bridgeMcpEndpointUrls()).toEqual({
+      core: 'http://127.0.0.1:45678/mcp/core/core-token',
+      desktop: 'http://127.0.0.1:45678/mcp/desktop/desktop-token',
+      plugins: 'http://127.0.0.1:45678/mcp/plugins/plugins-token'
+    });
+    await connection.disconnect();
+    expect(bridgeMcpEndpointUrls()).toBeNull();
+  });
+
+  it('serves Gemini through the local MCP endpoint without starting or claiming a remote tunnel', async () => {
+    const connection = await import('../src/main/connection.js');
+    await connection.connect('gemini');
+    expect(connection.getStatus()).toMatchObject({
+      state: 'disconnected',
+      localMcpReady: true,
+      detail: expect.stringContaining('Local MCP bridge ready')
+    });
+    expect(mocks.starts).toBe(0);
+    expect(mocks.secretReached).not.toHaveBeenCalled();
+    expect(mocks.reports.size).toBe(0);
+    await connection.disconnect();
+    expect(connection.getStatus().localMcpReady).toBe(false);
+  });
+
   it.each(['offline', 'auth-failed', 'tunnel-unavailable'])('notifies once when an established tunnel reports %s, and re-arms only on connected', async state => {
     vi.useFakeTimers();
     const connection = await import('../src/main/connection.js');

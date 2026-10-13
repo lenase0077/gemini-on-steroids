@@ -21,7 +21,7 @@ const offerToolInput = async (...args: Parameters<typeof offerToolInputBatch>) =
 vi.mock('../src/main/session/recorder.js', () => ({ noteChatOrigin: vi.fn(async () => undefined) }));
 
 const openings = vi.hoisted(() => new Map<string, { id: string; conversationId: string | null; origin: { kind: string } }>());
-const binding = vi.hoisted(() => ({ origin: 'desktop', conversationId: 'conversation-a', blocked: false, recorded: true, activeTurnId: null as string | null, lastToolCallAt: null as number | null, finishEnabled: true, goalEnabled: false, finishReleased: false, recoveryAllowed: true, model: 'gpt-6-astra', leadMinutes: 5, impulseMinutes: 0, end: null as null | { kind: string; outcome: string; reason?: string; turnId: string; time: number; seq?: number } }));
+const binding = vi.hoisted(() => ({ origin: 'desktop', conversationId: 'conversation-a', blocked: false, recorded: true, activeTurnId: null as string | null, lastToolCallAt: null as number | null, finishEnabled: true, goalEnabled: false, finishReleased: false, recoveryAllowed: true, model: 'gpt-6-astra', newChatProvider: 'chatgpt', sessionProvider: 'chatgpt', leadMinutes: 5, impulseMinutes: 0, end: null as null | { kind: string; outcome: string; reason?: string; turnId: string; time: number; seq?: number } }));
 vi.mock('../src/main/session/store.js', () => ({
   sessionsRoot: () => path.join(directory, 'sessions'),
   listUsageSessions: vi.fn(async () => []),
@@ -35,12 +35,13 @@ vi.mock('../src/main/session/store.js', () => ({
   rebindSession: vi.fn(async (id: string, from: string | null, to: string) => { const row = openings.get(id); if (!row || row.conversationId !== from) return false; row.conversationId = to; return true; }),
   getSession: vi.fn(async (id: string) => openings.get(id) ?? ({ id, conversationId: id === 'session-two' ? 'conversation-b' : binding.conversationId, activeTurnId: binding.activeTurnId,
     origin: { kind: binding.origin }, lastToolCallAt: binding.lastToolCallAt,
+    provider: binding.sessionProvider,
     finishTurn: { turnId: binding.activeTurnId, released: binding.finishReleased },
     selectedModel: { conversationId: id === 'session-two' ? 'conversation-b' : binding.conversationId, model: binding.model } })),
   findSessionByConversation: vi.fn(async (id: string) => [...openings.values()].find(row => row.conversationId === id) ?? (binding.recorded && id === binding.conversationId ? { id: 'session-one', conversationId: id } : null))
 }));
 vi.mock('../src/main/config.js', () => ({ getConfig: () => ({
-  ui: { finishTool: binding.finishEnabled, finishAction: 'goal', finishLeadMinutes: binding.leadMinutes },
+  ui: { finishTool: binding.finishEnabled, finishAction: 'goal', finishLeadMinutes: binding.leadMinutes, newChatProvider: binding.newChatProvider },
   goal: { enabled: binding.goalEnabled, mode: 'goal', impulseMinutes: binding.impulseMinutes },
   multiAgent: { strictChatAllowlist: false }
 }) }));
@@ -77,6 +78,8 @@ beforeEach(async () => {
   binding.activeTurnId = null;
   binding.lastToolCallAt = null;
   binding.finishEnabled = true; binding.goalEnabled = false; binding.finishReleased = false; binding.model = 'gpt-6-astra'; binding.leadMinutes = 5; binding.impulseMinutes = 0;
+  binding.newChatProvider = 'chatgpt';
+  binding.sessionProvider = 'chatgpt';
   binding.recoveryAllowed = true;
   binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'previous-turn', time: 0 };
   now = 1000;
@@ -90,6 +93,43 @@ afterEach(async () => {
 });
 
 describe('durable user input ownership', () => {
+  it('freezes the explicit new-chat provider at acceptance and preserves it across retry', async () => {
+    binding.newChatProvider = 'gemini';
+    const accepted = await enqueueInput(input({ sessionId: null }));
+    expect(accepted.provider).toBe('gemini');
+
+    binding.newChatProvider = 'chatgpt';
+    resetInputForTests();
+    const retried = await enqueueInput(input({ id: accepted.id, sessionId: null }));
+    expect(retried.provider).toBe('gemini');
+  });
+
+  it('projects the accepted Gemini provider with each pending browser input', async () => {
+    binding.newChatProvider = 'gemini';
+    const row = await enqueueInput(input({ sessionId: null }));
+
+    expect(await pendingBrowserInputs()).toContainEqual(expect.objectContaining({
+      id: row.id,
+      conversationId: null,
+      provider: 'gemini'
+    }));
+  });
+
+  it('inherits the persisted source provider for a Goal/Loop decision helper', async () => {
+    binding.newChatProvider = 'chatgpt';
+    binding.sessionProvider = 'gemini';
+    const controller = new AbortController();
+    const wake = vi.fn(async () => undefined);
+    configureInputDelivery({ applyAutomation: automate, changed, wakeDecision: wake });
+    const answer = requestBrowserDecision('Choose the next Goal step', controller.signal, { sourceSessionId: sessionId });
+    await vi.waitFor(async () => expect(await listInputs()).toHaveLength(1));
+    const helper = (await listInputs())[0]!;
+    expect(helper.provider).toBe('gemini');
+    expect(wake).toHaveBeenCalledWith(expect.objectContaining({ provider: 'gemini' }), controller.signal);
+    controller.abort();
+    await expect(answer).rejects.toThrow('goal_browser_cancelled');
+  });
+
   it.each([
     ['held for Setup', 'Message queued. Finish Setup to send: Enter a tunnel ID that looks like tunnel_ followed by 32 hex characters.', 'queued'],
     ['held after a failed browser start', 'Message queued. Browser startup failed: Chrome refused startup', 'queued'],
@@ -486,7 +526,7 @@ describe('durable user input ownership', () => {
     const stage = await enqueueInput(input({ mode: 'finish', text: 'Next stage A', afterTurn: true }));
     await enqueueInput(input({ sessionId: scheduledSession, dueAt: now + delay, text: 'Later input' }));
     binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'completed-a', time: now + 1 };
-    expect(await pendingBrowserInputs()).toContainEqual({ id: stage.id, conversationId: 'conversation-a' });
+    expect(await pendingBrowserInputs()).toContainEqual({ id: stage.id, conversationId: 'conversation-a', provider: 'chatgpt' });
   });
   it('keeps due direct input ahead of the same session completed plan stage', async () => {
     const stage = await enqueueInput(input({ mode: 'finish' }));
@@ -577,7 +617,7 @@ describe('durable user input ownership', () => {
     const row = await enqueueInput(input({ text: 'Read one file', dueAt: now }));
     // offeredAt is claim metadata, not proof that /status has published the offer.
     expect(row.offeredAt).toBeUndefined();
-    expect(await pendingBrowserInputs()).toEqual([{ id: row.id, conversationId: binding.conversationId }]);
+    expect(await pendingBrowserInputs()).toEqual([{ id: row.id, conversationId: binding.conversationId, provider: 'chatgpt' }]);
     const claim = await claimBrowserInput(row.id, 'exact-browser-document', binding.conversationId, true);
     expect(claim).toMatchObject({ state: 'browser', owner: 'exact-browser-document', offeredAt: now });
   });
@@ -622,7 +662,7 @@ describe('durable user input ownership', () => {
   it('retries preparation through existing offers but grants native Send only once to the current owner', async () => {
     const row = await enqueueInput(input({ sessionId: null }));
     await claimBrowserInput(row.id, 'lost-response-page', null, true);
-    expect(await pendingBrowserInputs()).toEqual([{ id: row.id, conversationId: null }]);
+    expect(await pendingBrowserInputs()).toEqual([{ id: row.id, conversationId: null, provider: 'chatgpt' }]);
     expect(await claimBrowserInput(row.id, 'replacement-page', null, true)).toMatchObject({ id: row.id, owner: 'replacement-page' });
     expect(await authorizeBrowserInput(row.id, 'lost-response-page', null)).toBe(false);
     expect(await authorizeBrowserInput(row.id, 'replacement-page', null)).toBe(true);
@@ -714,7 +754,7 @@ describe('durable user input ownership', () => {
     const after = await seedLegacyInput(input({ mode: 'after-turn' }));
     now += 600001;
     binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'fresh-end', time: now };
-    expect(await pendingBrowserInputs()).toContainEqual({ id: after.id, conversationId: binding.conversationId });
+    expect(await pendingBrowserInputs()).toContainEqual({ id: after.id, conversationId: binding.conversationId, provider: 'chatgpt' });
     expect((await listInputs()).find(row => row.id === stale.id)).toMatchObject({ state: 'queued', opening: true, sessionId: stale.id });
     resetInputForTests();
     expect(await claimBrowserInput(stale.id, 'after-restart', null)).toMatchObject({ id: stale.id, state: 'browser' });
@@ -953,7 +993,7 @@ describe('durable user input ownership', () => {
     binding.conversationId = 'conversation-b';
     expect(await offerToolInput(sessionId, 'conversation-a', 'old', 0)).toEqual([]);
     expect(await claimBrowserInput(row.id, 'page-a', 'conversation-a')).toBeNull();
-    expect(await pendingBrowserInputs()).toEqual([{ id: row.id, conversationId: 'conversation-b', supersededConversationId: 'conversation-a' }]);
+    expect(await pendingBrowserInputs()).toEqual([{ id: row.id, conversationId: 'conversation-b', provider: 'chatgpt', supersededConversationId: 'conversation-a' }]);
     expect(await claimBrowserInput(row.id, 'page-b', 'conversation-b')).toMatchObject({ state: 'browser' });
   });
   it('legacy queue: elects one browser owner and excludes tools for that session', async () => {
@@ -1022,7 +1062,7 @@ describe('durable user input ownership', () => {
     expect((await pendingBrowserInputs()).map(row => row.id)).toEqual([auto.id]);
     expect(await hasEligibleToolInput(sessionId)).toBe(true);
     expect((await offerToolInput(sessionId, binding.conversationId, 'request', 0)).map(row => row.text)).toEqual([auto.text]);
-    expect(await pendingBrowserInputs()).not.toContainEqual({ id: after.id, conversationId: binding.conversationId });
+    expect(await pendingBrowserInputs()).not.toContainEqual({ id: after.id, conversationId: binding.conversationId, provider: 'chatgpt' });
     expect(await claimBrowserInput(later.id, 'page', binding.conversationId)).toBeNull();
     expect((await listInputs()).find(row => row.id === after.id)?.state).toBe('queued');
     expect((await listInputs()).find(row => row.id === later.id)?.state).toBe('queued');
@@ -1140,7 +1180,7 @@ describe('browser decision lifetime', () => {
     expect(await pendingBrowserInputs()).toEqual([]);
     expect(await claimBrowserInput(entry.id, 'fresh-marker-document', null)).toBeNull();
     now += 60000;
-    expect(await pendingBrowserInputs()).toEqual([{ id: entry.id, conversationId: null }]);
+    expect(await pendingBrowserInputs()).toEqual([{ id: entry.id, conversationId: null, provider: 'chatgpt' }]);
     expect(await claimBrowserInput(entry.id, 'fresh-marker-document', null)).toMatchObject({ id: entry.id, state: 'browser' });
   });
   it('requires a deliberate exact-source retry and never revives the previous owner', async () => {
@@ -1175,7 +1215,7 @@ describe('browser decision lifetime', () => {
     });
     const row = (await listInputs())[0]!;
     expect(row).toMatchObject({ sessionId: null, decisionSourceSessionId: sessionId, model: 'gpt-5.6-sol', reasoningEffort: 'high' });
-    expect(await pendingBrowserInputs()).toEqual([{ id: row.id, conversationId: 'helper-conversation' }]);
+    expect(await pendingBrowserInputs()).toEqual([{ id: row.id, conversationId: 'helper-conversation', provider: 'chatgpt' }]);
     expect(await claimBrowserInput(row.id, 'wrong', binding.conversationId)).toBeNull();
     expect(await claimBrowserInput(row.id, 'helper', 'helper-conversation')).not.toBeNull();
     expect(await completeBrowserDecision(row.id, 'helper', 'reply', binding.conversationId)).toBe(false);
@@ -1349,7 +1389,7 @@ it.each(['finish', 'after-turn'] as const)('sends only one queued %s after each 
   const first = await enqueueInput(input({ mode, text: 'Second stage' }));
   const second = await enqueueInput(input({ mode, text: 'Third stage' }));
   binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'turn-one', time: now + 1 };
-  expect(await pendingBrowserInputs()).toEqual([{ id: first.id, conversationId: binding.conversationId }]);
+  expect(await pendingBrowserInputs()).toEqual([{ id: first.id, conversationId: binding.conversationId, provider: 'chatgpt' }]);
   await claimBrowserInput(first.id, 'page', binding.conversationId, true);
   await expect(enqueueInput(input())).rejects.toThrow('One message');
   await authorizeBrowserInput(first.id, 'page', binding.conversationId);
@@ -1362,7 +1402,7 @@ it.each(['finish', 'after-turn'] as const)('sends only one queued %s after each 
   expect(await pendingBrowserInputs()).toEqual([]);
   binding.activeTurnId = null;
   binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'turn-two', time: now + 2 };
-  expect(await pendingBrowserInputs()).toEqual([{ id: second.id, conversationId: binding.conversationId }]);
+  expect(await pendingBrowserInputs()).toEqual([{ id: second.id, conversationId: binding.conversationId, provider: 'chatgpt' }]);
 });
 
 it.each(['finish', 'after-turn'] as const)('does not advance %s on interruption, unknown outcome, error, or stale completion', async mode => {
@@ -1383,7 +1423,7 @@ it.each(['finish', 'after-turn'] as const)('spends a settled Thinking failed onc
   binding.end = { kind: 'turn_end', outcome: 'failed', reason: 'thinking_failed', turnId: 'failed-pro-turn', time: now + 1, seq: 12 };
   expect(await pendingBrowserInputs()).toEqual([]);
   await fileSilenceInput(sessionId, binding.conversationId, binding.end.turnId, () => true);
-  expect(await pendingBrowserInputs()).toEqual([{ id: rows[0]!.id, conversationId: binding.conversationId, silenceTurnId: binding.end.turnId }]);
+  expect(await pendingBrowserInputs()).toEqual([{ id: rows[0]!.id, conversationId: binding.conversationId, provider: 'chatgpt', silenceTurnId: binding.end.turnId }]);
   expect(await claimBrowserInput(rows[1]!.id, 'page', binding.conversationId, true)).toBeNull();
   expect(await claimBrowserInput(rows[0]!.id, 'page', binding.conversationId, true)).not.toBeNull();
   expect(await authorizeBrowserInput(rows[0]!.id, 'page', binding.conversationId)).toBe(true);
@@ -1393,7 +1433,7 @@ it.each(['finish', 'after-turn'] as const)('spends a settled Thinking failed onc
   expect((await listInputs()).filter(row => row.state === 'queued')).toHaveLength(9);
   binding.end = { ...binding.end, turnId: 'next-failed-pro-turn', time: now + 2 };
   await fileSilenceInput(sessionId, binding.conversationId, binding.end.turnId, () => true);
-  expect(await pendingBrowserInputs()).toEqual([{ id: rows[1]!.id, conversationId: binding.conversationId, silenceTurnId: binding.end.turnId }]);
+  expect(await pendingBrowserInputs()).toEqual([{ id: rows[1]!.id, conversationId: binding.conversationId, provider: 'chatgpt', silenceTurnId: binding.end.turnId }]);
 });
 
 it.each(['late-tool', 'running-tool', 'new-turn', 'different-end', 'blocked'])('revokes a Thinking failed claim before Send after %s', async change => {
@@ -1716,7 +1756,7 @@ it('allows one browser send alongside other-chat tool input but prevents same-ch
   binding.end = null;
   const browser = await enqueueInput(input({ sessionId: null }));
   expect(browser.transportIntent).toBe('browser');
-  expect(await pendingBrowserInputs()).toEqual([{ id: browser.id, conversationId: null }]);
+  expect(await pendingBrowserInputs()).toEqual([{ id: browser.id, conversationId: null, provider: 'chatgpt' }]);
   const independent = await enqueueInput(input({ sessionId: null }));
   await cancelInput(independent.id);
   await cancelInput(browser.id);
@@ -1755,7 +1795,7 @@ it('keeps Astra finish-only tasks off browser transport across restart and permi
   expect(await pendingBrowserInputs()).toEqual([]);
   expect(await editQueuedInput(row.id, row.text, true)).toBe(true);
   resetInputForTests();
-  expect(await pendingBrowserInputs()).toEqual([{ id: row.id, conversationId: binding.conversationId }]);
+  expect(await pendingBrowserInputs()).toEqual([{ id: row.id, conversationId: binding.conversationId, provider: 'chatgpt' }]);
   expect(await editQueuedInput(row.id, row.text, false)).toBe(true);
   expect(await pendingBrowserInputs()).toEqual([]);
   expect(await offerToolInput(sessionId, binding.conversationId, 'finish-only-test', now, true)).toHaveLength(1);
@@ -1771,7 +1811,7 @@ it('keeps a finish-only head ahead of opted-in browser tasks until explicitly re
   expect(await claimBrowserInput(later.id, 'page', binding.conversationId, true)).toBeNull();
   expect(await claimBrowserInput(after.id, 'page', binding.conversationId, true)).toBeNull();
   expect(await reorderQueuedInputs(sessionId, [after.id, blocked.id, later.id])).toBe(true);
-  expect(await pendingBrowserInputs()).toEqual([{ id: after.id, conversationId: binding.conversationId }]);
+  expect(await pendingBrowserInputs()).toEqual([{ id: after.id, conversationId: binding.conversationId, provider: 'chatgpt' }]);
   expect(await claimBrowserInput(after.id, 'page', binding.conversationId, true)).not.toBeNull();
   expect(await authorizeBrowserInput(after.id, 'page', binding.conversationId)).toBe(true);
   expect(await acknowledgeBrowserInput(after.id, 'page', binding.conversationId, 'message-after')).toBe(true);
@@ -1837,7 +1877,7 @@ describe('visible input priority before Goal', () => {
     expect(reordered.find(row => row.id === b.id)?.silenceBoundary).toMatchObject({ turnId: 'failed-source', listenUntil });
     expect(await pendingBrowserInputs()).toEqual([]);
     now = listenUntil;
-    expect(await pendingBrowserInputs()).toEqual([{ id: b.id, conversationId: binding.conversationId, silenceTurnId: 'failed-source' }]);
+    expect(await pendingBrowserInputs()).toEqual([{ id: b.id, conversationId: binding.conversationId, provider: 'chatgpt', silenceTurnId: 'failed-source' }]);
     expect(await claimBrowserInput(a.id, 'page', binding.conversationId, true)).toBeNull();
     expect(await claimBrowserInput(b.id, 'page', binding.conversationId, true)).not.toBeNull();
   });
@@ -1857,7 +1897,7 @@ it('delivers a legacy finish checkpoint after an ordinary turn without restoring
   resetInputForTests();
   binding.model = 'gpt-5.6-sol';
   binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'ordinary-completed', time: now + 1 };
-  expect(await pendingBrowserInputs()).toEqual([{ id: row.id, conversationId: binding.conversationId }]);
+  expect(await pendingBrowserInputs()).toEqual([{ id: row.id, conversationId: binding.conversationId, provider: 'chatgpt' }]);
   const claimed = await claimBrowserInput(row.id, 'page', binding.conversationId, true);
   expect(claimed).toMatchObject({ model: null, reasoningEffort: null, text: 'Final checkpoint' });
   expect(claimed?.deliveryText).not.toContain('session_finish');

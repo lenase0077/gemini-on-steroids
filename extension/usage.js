@@ -449,7 +449,10 @@
     }
   }
   function installSocketObserver() {
-    if (!active || typeof window.WebSocket !== 'function' || window.WebSocket === observedWebSocket) return;
+    // This observer only understands ChatGPT's OpenAI stream protocol. Do not even wrap
+    // Gemini's WebSocket constructor; its Angular app has an unrelated transport.
+    if (!active || !/^(?:(?:[^.]+\.)*chatgpt\.com|chat\.openai\.com)$/i.test(location.hostname || '') ||
+        typeof window.WebSocket !== 'function' || window.WebSocket === observedWebSocket) return;
     observedWebSocket = new Proxy(window.WebSocket, {
       construct(target, args, newTarget) {
         const socket = Reflect.construct(target, args, newTarget);

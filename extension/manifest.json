@@ -43,7 +43,8 @@
     {
       "matches": [
         "https://chatgpt.com/*",
-        "https://chat.openai.com/*"
+        "https://chat.openai.com/*",
+        "https://gemini.google.com/*"
       ],
       "js": [
         "i18n.js",

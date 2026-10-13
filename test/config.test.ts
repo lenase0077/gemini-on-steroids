@@ -43,6 +43,19 @@ describe('browser bridge port config', () => {
   });
 });
 
+describe('new chat provider preference', () => {
+  it('defaults legacy settings to ChatGPT and persists an explicit Gemini choice', async () => {
+    const legacy = defaultConfig();
+    expect(legacy.ui.newChatProvider).toBe('chatgpt');
+    delete legacy.ui.newChatProvider;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(legacy), 'utf8');
+    expect((await loadConfig()).ui.newChatProvider).toBe('chatgpt');
+
+    await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, newChatProvider: 'gemini' } });
+    expect((await loadConfig()).ui.newChatProvider).toBe('gemini');
+  });
+});
+
 describe('settings migration', () => {
   it('defaults command policy enforcement off in allow mode and round-trips both modes', async () => {
     expect(defaultConfig().commandAllowlist).toEqual({ enabled: false, mode: 'allow', rules: [] });

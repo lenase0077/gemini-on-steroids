@@ -7,12 +7,14 @@
  */
 
 import { connectorProof } from './connector-proof.js';
+import type { ChatProvider } from '../shared/chat-provider.js';
 import type { ConnectionState, ConnectionStatus, SurfaceStatus, TunnelSettings } from '../shared/types.js';
 import { requiresApprovedFilesystemRoot } from '../shared/capabilities.js';
 import { prewarmComputerHelper } from './computer/index.js';
 import { effectiveCapabilities, getConfig } from './config.js';
 import { logError, logInfo, logWarn } from './logger.js';
 import { lastRequestAt, startMcpServer, tunnelProbeHeaders, type McpEndpoint } from './mcp/server.js';
+import { publishBridgeMcpEndpoint } from './mcp/bridge-endpoint.js';
 import { lastToolCallAt } from './mcp/tools.js';
 import { SURFACE_LIST, configuredConnectorName, liveConnectorName, surfaceIsUseful, desktopToolNames, type SurfaceId } from './mcp/surfaces.js';
 import { getSecret } from './secrets.js';
@@ -93,6 +95,7 @@ let status: ConnectionStatus = {
   lastRequestAt: null,
   lastToolCallAt: null,
   health: null,
+  localMcpReady: false,
   surfaces: []
 };
 
@@ -210,6 +213,7 @@ export function getStatus(): ConnectionStatus {
   // checkboxes, which change without any connection event to recompute them.
   return {
     ...status,
+    localMcpReady: endpoint !== null,
     lastRequestAt: lastRequestAt(),
     lastToolCallAt: lastToolCallAt(),
     routeSettlingUntil: tunnelRouteSettlingUntil(),
@@ -223,7 +227,7 @@ export function onStatusChange(listener: (status: ConnectionStatus) => void): ()
 }
 
 function setStatus(next: Partial<ConnectionStatus>): void {
-  status = { ...status, ...next };
+  status = { ...status, ...next, localMcpReady: endpoint !== null };
   for (const listener of listeners) listener(status);
 }
 
@@ -366,8 +370,9 @@ function siblingPublicUrl(publicUrl: string | null, localUrl: string | null): st
   }
 }
 
-async function connectImpl(): Promise<void> {
+async function connectImpl(requestedProvider?: ChatProvider): Promise<void> {
   if (shutdownRequested || pendingDisconnect) return;
+  const provider = requestedProvider ?? getConfig().ui.newChatProvider ?? 'chatgpt';
   // Offline counts as running: the tunnel is alive and retrying on its own.
   if (
     status.state === 'connected' ||
@@ -377,6 +382,7 @@ async function connectImpl(): Promise<void> {
   ) {
     return;
   }
+  if (provider === 'gemini' && endpoint) return;
   await disconnectImpl();
   // disconnectImpl can itself await a live endpoint/tunnel. Final shutdown may be requested
   // while that stop is in progress; never mint a fresh generation afterwards and thereby undo
@@ -416,12 +422,18 @@ async function connectImpl(): Promise<void> {
       return;
     }
     endpoint = startedEndpoint;
+    publishBridgeMcpEndpoint(startedEndpoint.urls);
     if (generation !== connectionGeneration) {
       await disconnectImpl();
       return;
     }
     setStatus({ localUrl: endpoint.url, surfaces: describeSurfaces() });
     if (desktopAutomationSupported() && (caps.screen || caps.control)) void prewarmComputerHelper();
+    if (provider === 'gemini') {
+      updateSurface('core', { state: 'off', detail: 'Not published remotely. The local MCP bridge is available to the paired Gemini extension.' });
+      setStatus({ state: 'disconnected', detail: 'Local MCP bridge ready. Remote tunnel and native ChatGPT connector are not required for Gemini.' });
+      return;
+    }
     updateSurface('core', { state: 'starting', detail: 'Connecting…' });
 
     const apiKey = await getSecret(setupApiKeySlot(config.tunnel.profileId));
@@ -584,8 +596,13 @@ async function stopOptionalTunnel(id: OptionalSurface, detail: string): Promise<
  */
 async function applySettingsImpl(): Promise<void> {
   if (shutdownRequested || pendingDisconnect) return;
-  if (!endpoint) return;
   const config = getConfig();
+  if (!endpoint) {
+    // Gemini's DOM bridge needs the authenticated local listener, not a public tunnel or a
+    // native ChatGPT connector. Explicit provider selection is enough to start that listener.
+    if (config.ui.newChatProvider === 'gemini') await connectImpl('gemini');
+    return;
+  }
   const desiredCoreTransport = coreTransport(config.tunnel);
   if (activeCoreTransport && !sameCoreTransport(activeCoreTransport, desiredCoreTransport)) {
     logInfo('core connection settings changed; reconnecting');
@@ -647,6 +664,7 @@ async function disconnectResources(endpointForceAfterMs?: number): Promise<void>
   if (endpoint) {
     const stopping = endpoint;
     endpoint = null;
+    publishBridgeMcpEndpoint(null);
     drainingEndpoint = stopping;
     try {
       const forceAfterMs = endpointForceAfterMs ?? (shutdownRequested ? 30_000 : undefined);
@@ -675,9 +693,9 @@ async function disconnectResources(endpointForceAfterMs?: number): Promise<void>
   });
 }
 
-export function connect(): Promise<void> {
+export function connect(provider?: ChatProvider): Promise<void> {
   if (shutdownRequested) return Promise.resolve();
-  return enqueueLifecycle(connectImpl);
+  return enqueueLifecycle(() => connectImpl(provider));
 }
 
 export function disconnect(): Promise<void> {
